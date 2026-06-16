@@ -16,11 +16,13 @@
 // from aria/aria.cc.inc. The mode logic is kept self-contained so ARIA does
 // not depend on the AES-specific mode helpers.
 
+#include <openssl/aead.h>
 #include <openssl/aria.h>
 #include <openssl/cipher.h>
 #include <openssl/err.h>
 #include <openssl/mem.h>
 #include <openssl/nid.h>
+#include <openssl/span.h>
 
 #include <string.h>
 
@@ -480,3 +482,177 @@ DEFINE_ARIA_CIPHER(EVP_aria_256_ctr, NID_aria_256_ctr, 32, 16, 1,
 DEFINE_ARIA_GCM_CIPHER(EVP_aria_128_gcm, NID_aria_128_gcm, 16)
 DEFINE_ARIA_GCM_CIPHER(EVP_aria_192_gcm, NID_aria_192_gcm, 24)
 DEFINE_ARIA_GCM_CIPHER(EVP_aria_256_gcm, NID_aria_256_gcm, 32)
+
+// ---------------------------------------------------------------------------
+// ARIA-CCM AEAD. Reuses the generic CCM128 core from e_aesccm.cc.inc (included
+// earlier in bcm.cc) via ARIA block and CTR32 adapters. Exposed through the
+// EVP_AEAD interface, mirroring EVP_aead_aes_*_ccm. Uses M=16 (16-byte tag),
+// L=3 (12-byte nonce).
+// ---------------------------------------------------------------------------
+
+// block128_f / ctr128_f hard-code |AES_KEY *|; ARIA stores its schedule in the
+// AEAD context and reinterprets the pointer, matching how BoringSSL threads
+// opaque key state through the mode helpers.
+static void aria_block128(const uint8_t in[16], uint8_t out[16],
+                          const AES_KEY *key) {
+  ARIA_encrypt_block(in, out, reinterpret_cast<const ARIA_KEY *>(key));
+}
+
+static void aria_ctr32_encrypt_blocks(const uint8_t *in, uint8_t *out,
+                                      size_t blocks, const AES_KEY *key,
+                                      const uint8_t ivec[16]) {
+  const ARIA_KEY *ak = reinterpret_cast<const ARIA_KEY *>(key);
+  uint8_t ctr[16];
+  OPENSSL_memcpy(ctr, ivec, 16);
+  uint32_t c = CRYPTO_load_u32_be(ctr + 12);
+  uint8_t ks[16];
+  while (blocks--) {
+    ARIA_encrypt_block(ctr, ks, ak);
+    CRYPTO_xor16(out, in, ks);
+    in += 16;
+    out += 16;
+    c++;
+    CRYPTO_store_u32_be(ctr + 12, c);
+  }
+  OPENSSL_cleanse(ks, sizeof(ks));
+}
+
+namespace {
+struct aead_aria_ccm_ctx {
+  ARIA_KEY ks;
+  struct ccm128_context ccm;
+};
+}  // namespace
+
+static_assert(sizeof(((EVP_AEAD_CTX *)nullptr)->state) >=
+                  sizeof(struct aead_aria_ccm_ctx),
+              "AEAD state is too small");
+static_assert(alignof(union evp_aead_ctx_st_state) >=
+                  alignof(struct aead_aria_ccm_ctx),
+              "AEAD state has insufficient alignment");
+
+static int aead_aria_ccm_init(EVP_AEAD_CTX *ctx, const uint8_t *key,
+                              size_t key_len, size_t tag_len, unsigned M,
+                              unsigned L) {
+  if (key_len != EVP_AEAD_key_length(ctx->aead)) {
+    OPENSSL_PUT_ERROR(CIPHER, CIPHER_R_BAD_KEY_LENGTH);
+    return 0;
+  }
+  if (tag_len == EVP_AEAD_DEFAULT_TAG_LENGTH) {
+    tag_len = M;
+  }
+  if (tag_len != M) {
+    OPENSSL_PUT_ERROR(CIPHER, CIPHER_R_TAG_TOO_LARGE);
+    return 0;
+  }
+
+  auto *ccm_ctx = reinterpret_cast<struct aead_aria_ccm_ctx *>(&ctx->state);
+  if (ARIA_set_encrypt_key(key, key_len * 8, &ccm_ctx->ks) < 0) {
+    OPENSSL_PUT_ERROR(CIPHER, CIPHER_R_AES_KEY_SETUP_FAILED);
+    return 0;
+  }
+  ctx->tag_len = tag_len;
+  if (!CRYPTO_ccm128_init(&ccm_ctx->ccm,
+                          reinterpret_cast<const AES_KEY *>(&ccm_ctx->ks),
+                          aria_block128, aria_ctr32_encrypt_blocks, M, L)) {
+    OPENSSL_PUT_ERROR(CIPHER, ERR_R_INTERNAL_ERROR);
+    return 0;
+  }
+  return 1;
+}
+
+static void aead_aria_ccm_cleanup(EVP_AEAD_CTX *ctx) {
+  auto *ccm_ctx = reinterpret_cast<struct aead_aria_ccm_ctx *>(&ctx->state);
+  OPENSSL_cleanse(&ccm_ctx->ks, sizeof(ccm_ctx->ks));
+}
+
+static int aead_aria_ccm_sealv(const EVP_AEAD_CTX *ctx,
+                               Span<const CRYPTO_IOVEC> iovecs,
+                               Span<uint8_t> out_tag, size_t *out_tag_len,
+                               Span<const uint8_t> nonce,
+                               Span<const CRYPTO_IVEC> aadvecs) {
+  const auto *ccm_ctx =
+      reinterpret_cast<const struct aead_aria_ccm_ctx *>(&ctx->state);
+
+  if (bssl::iovec::TotalLength(iovecs) >
+      CRYPTO_ccm128_max_input(&ccm_ctx->ccm)) {
+    OPENSSL_PUT_ERROR(CIPHER, CIPHER_R_TOO_LARGE);
+    return 0;
+  }
+  if (out_tag.size() < ctx->tag_len) {
+    OPENSSL_PUT_ERROR(CIPHER, CIPHER_R_BUFFER_TOO_SMALL);
+    return 0;
+  }
+  if (nonce.size() != EVP_AEAD_nonce_length(ctx->aead)) {
+    OPENSSL_PUT_ERROR(CIPHER, CIPHER_R_INVALID_NONCE_SIZE);
+    return 0;
+  }
+
+  if (!CRYPTO_ccm128_encrypt(&ccm_ctx->ccm,
+                             reinterpret_cast<const AES_KEY *>(&ccm_ctx->ks),
+                             iovecs, out_tag.first(ctx->tag_len), nonce,
+                             aadvecs)) {
+    return 0;
+  }
+  *out_tag_len = ctx->tag_len;
+  AEAD_CCM_verify_service_indicator(ctx);
+  return 1;
+}
+
+static int aead_aria_ccm_openv_detached(const EVP_AEAD_CTX *ctx,
+                                        Span<const CRYPTO_IOVEC> iovecs,
+                                        Span<const uint8_t> nonce,
+                                        Span<const uint8_t> in_tag,
+                                        Span<const CRYPTO_IVEC> aadvecs) {
+  const auto *ccm_ctx =
+      reinterpret_cast<const struct aead_aria_ccm_ctx *>(&ctx->state);
+
+  if (bssl::iovec::TotalLength(iovecs) >
+      CRYPTO_ccm128_max_input(&ccm_ctx->ccm)) {
+    OPENSSL_PUT_ERROR(CIPHER, CIPHER_R_TOO_LARGE);
+    return 0;
+  }
+  if (nonce.size() != EVP_AEAD_nonce_length(ctx->aead)) {
+    OPENSSL_PUT_ERROR(CIPHER, CIPHER_R_INVALID_NONCE_SIZE);
+    return 0;
+  }
+  if (in_tag.size() != ctx->tag_len) {
+    OPENSSL_PUT_ERROR(CIPHER, CIPHER_R_BAD_DECRYPT);
+    return 0;
+  }
+
+  uint8_t tag[EVP_AEAD_AES_CCM_MAX_TAG_LEN];
+  if (!CRYPTO_ccm128_decrypt(&ccm_ctx->ccm,
+                             reinterpret_cast<const AES_KEY *>(&ccm_ctx->ks),
+                             iovecs, Span(tag).first(ctx->tag_len), nonce,
+                             aadvecs)) {
+    return 0;
+  }
+  if (CRYPTO_memcmp(tag, in_tag.data(), ctx->tag_len) != 0) {
+    OPENSSL_PUT_ERROR(CIPHER, CIPHER_R_BAD_DECRYPT);
+    return 0;
+  }
+  AEAD_CCM_verify_service_indicator(ctx);
+  return 1;
+}
+
+#define DEFINE_ARIA_CCM_AEAD(name, init_fn, klen)        \
+  static int init_fn(EVP_AEAD_CTX *ctx, const uint8_t *key, size_t key_len, \
+                     size_t tag_len) {                                      \
+    return aead_aria_ccm_init(ctx, key, key_len, tag_len, 16, 3);           \
+  }                                                                         \
+  DEFINE_METHOD_FUNCTION(EVP_AEAD, name) {                                  \
+    memset(out, 0, sizeof(EVP_AEAD));                                       \
+    out->key_len = (klen);                                                  \
+    out->nonce_len = 12;                                                    \
+    out->overhead = 16;                                                     \
+    out->max_tag_len = 16;                                                  \
+    out->init = init_fn;                                                    \
+    out->cleanup = aead_aria_ccm_cleanup;                                   \
+    out->sealv = aead_aria_ccm_sealv;                                       \
+    out->openv_detached = aead_aria_ccm_openv_detached;                     \
+  }
+
+DEFINE_ARIA_CCM_AEAD(EVP_aead_aria_128_ccm, aead_aria_128_ccm_init, 16)
+DEFINE_ARIA_CCM_AEAD(EVP_aead_aria_192_ccm, aead_aria_192_ccm_init, 24)
+DEFINE_ARIA_CCM_AEAD(EVP_aead_aria_256_ccm, aead_aria_256_ccm_init, 32)
