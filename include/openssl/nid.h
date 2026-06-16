@@ -5579,6 +5579,20 @@ extern "C" {
 #define SN_hight_ctr "HIGHT-CTR"
 #define NID_hight_ctr 2107
 
+// LSH hash function (KS X 3262), a KCMVP validation-target algorithm.
+#define SN_lsh256_224 "LSH-256-224"
+#define NID_lsh256_224 2201
+#define SN_lsh256_256 "LSH-256-256"
+#define NID_lsh256_256 2202
+#define SN_lsh512_224 "LSH-512-224"
+#define NID_lsh512_224 2203
+#define SN_lsh512_256 "LSH-512-256"
+#define NID_lsh512_256 2204
+#define SN_lsh512_384 "LSH-512-384"
+#define NID_lsh512_384 2205
+#define SN_lsh512_512 "LSH-512-512"
+#define NID_lsh512_512 2206
+
 #define SN_X_Wing "X-Wing"
 #define NID_X_Wing 972
 

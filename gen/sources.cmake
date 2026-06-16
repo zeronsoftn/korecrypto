@@ -37,6 +37,7 @@ set(
   crypto/fipsmodule/lea/lea.cc.inc
   crypto/fipsmodule/seed/seed.cc.inc
   crypto/fipsmodule/hight/hight.cc.inc
+  crypto/fipsmodule/lsh/lsh.cc.inc
   crypto/fipsmodule/bn/add.cc.inc
   crypto/fipsmodule/bn/asm/x86_64-gcc.cc.inc
   crypto/fipsmodule/bn/bn.cc.inc
@@ -568,6 +569,7 @@ set(
   include/openssl/lea.h
   include/openssl/seed.h
   include/openssl/hight.h
+  include/openssl/lsh.h
   include/openssl/arm_arch.h
   include/openssl/asm_base.h
   include/openssl/asn1.h

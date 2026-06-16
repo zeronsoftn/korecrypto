@@ -344,9 +344,10 @@ OPENSSL_EXPORT int EVP_Q_digest(OSSL_LIB_CTX *libctx, const char *name,
 struct evp_md_pctx_ops;
 
 // EVP_MAX_MD_DATA_SIZE is a private constant which specifies the size of the
-// largest digest state. SHA-512 and BLAKE2b are joint-largest. Consuming code
-// only uses this via the `EVP_MD_CTX` type.
-#define EVP_MAX_MD_DATA_SIZE 208
+// largest digest state. LSH-512 is the largest (a 256-byte block buffer plus a
+// 128-byte chaining value); among the others SHA-512 and BLAKE2b are joint-
+// largest. Consuming code only uses this via the `EVP_MD_CTX` type.
+#define EVP_MAX_MD_DATA_SIZE 416
 
 // env_md_ctx_st is typoed ("evp" -> "env"), but the typo comes from OpenSSL
 // and some consumers forward-declare these structures so we're leaving it

@@ -89,6 +89,7 @@ OPENSSL_CLANG_PRAGMA("clang diagnostic ignored \"-Wheader-hygiene\"")
 #include "dh/dh.cc.inc"
 #include "digest/digest.cc.inc"
 #include "digest/digests.cc.inc"
+#include "lsh/lsh.cc.inc"
 #include "digestsign/digestsign.cc.inc"
 #include "ec/ec.cc.inc"
 #include "ec/ec_key.cc.inc"
