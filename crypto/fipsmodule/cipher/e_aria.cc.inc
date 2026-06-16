@@ -18,13 +18,20 @@
 
 #include <openssl/aria.h>
 #include <openssl/cipher.h>
+#include <openssl/err.h>
+#include <openssl/mem.h>
 #include <openssl/nid.h>
 
 #include <string.h>
 
+#include "../../internal.h"
+#include "../aes/internal.h"
+#include "../bcm_interface.h"
 #include "../delocate.h"
+#include "../service_indicator/internal.h"
 #include "internal.h"
 
+using namespace bssl;
 
 typedef struct {
   ARIA_KEY ks;
@@ -112,6 +119,331 @@ static int aria_ctr_cipher_update(EVP_CIPHER_CTX *ctx, uint8_t *out,
   return 1;
 }
 
+// ---------------------------------------------------------------------------
+// ARIA-GCM (and GMAC). GHASH field arithmetic is provided by the generic
+// |CRYPTO_ghash_init|; the counter-mode keystream uses |ARIA_encrypt_block|.
+// The sequence mirrors crypto/fipsmodule/aes/gcm.cc.inc.
+// ---------------------------------------------------------------------------
+
+#define ARIA_GCM_NONCE_LENGTH 12
+
+typedef struct {
+  ARIA_KEY ks;
+  u128 Htable[16];
+  gmult_func gmult;
+  ghash_func ghash;
+
+  uint8_t Yi[16];   // counter block
+  uint8_t EKi[16];  // current keystream block
+  uint8_t EK0[16];  // E(J0), used for the tag
+  uint8_t Xi[16];   // GHASH accumulator
+  uint64_t aad_len;
+  uint64_t msg_len;
+  unsigned mres;  // partial message residue (0..15)
+  unsigned ares;  // partial AAD residue (0..15)
+
+  int key_set;
+  int iv_set;
+  uint8_t *iv;
+  int ivlen;
+  int taglen;
+  int iv_gen;
+} EVP_ARIA_GCM_CTX;
+
+static void aria_gcm_setup_key(EVP_ARIA_GCM_CTX *gctx) {
+  uint8_t h[16] = {0};
+  ARIA_encrypt_block(h, h, &gctx->ks);
+  CRYPTO_ghash_init(&gctx->gmult, &gctx->ghash, gctx->Htable, h);
+  OPENSSL_cleanse(h, sizeof(h));
+}
+
+static inline void aria_gcm_ctr32_inc(uint8_t Yi[16]) {
+  uint32_t ctr = CRYPTO_load_u32_be(Yi + 12);
+  CRYPTO_store_u32_be(Yi + 12, ctr + 1);
+}
+
+static void aria_gcm_set_iv(EVP_ARIA_GCM_CTX *gctx, const uint8_t *iv,
+                            size_t iv_len) {
+  OPENSSL_memset(gctx->Yi, 0, sizeof(gctx->Yi));
+  OPENSSL_memset(gctx->Xi, 0, sizeof(gctx->Xi));
+  gctx->aad_len = 0;
+  gctx->msg_len = 0;
+  gctx->ares = 0;
+  gctx->mres = 0;
+
+  if (iv_len == 12) {
+    OPENSSL_memcpy(gctx->Yi, iv, 12);
+    gctx->Yi[15] = 1;
+  } else {
+    uint64_t len0 = iv_len;
+    while (iv_len >= 16) {
+      CRYPTO_xor16(gctx->Yi, gctx->Yi, iv);
+      gctx->gmult(gctx->Yi, gctx->Htable);
+      iv += 16;
+      iv_len -= 16;
+    }
+    if (iv_len) {
+      for (size_t i = 0; i < iv_len; i++) {
+        gctx->Yi[i] ^= iv[i];
+      }
+      gctx->gmult(gctx->Yi, gctx->Htable);
+    }
+    uint8_t len_block[16];
+    OPENSSL_memset(len_block, 0, 8);
+    CRYPTO_store_u64_be(len_block + 8, len0 << 3);
+    CRYPTO_xor16(gctx->Yi, gctx->Yi, len_block);
+    gctx->gmult(gctx->Yi, gctx->Htable);
+  }
+
+  ARIA_encrypt_block(gctx->Yi, gctx->EK0, &gctx->ks);
+  aria_gcm_ctr32_inc(gctx->Yi);
+}
+
+static void aria_gcm_aad(EVP_ARIA_GCM_CTX *gctx, const uint8_t *aad,
+                         size_t len) {
+  gctx->aad_len += len;
+  unsigned n = gctx->ares;
+  for (size_t i = 0; i < len; i++) {
+    gctx->Xi[n] ^= aad[i];
+    n = (n + 1) % 16;
+    if (n == 0) {
+      gctx->gmult(gctx->Xi, gctx->Htable);
+    }
+  }
+  gctx->ares = n;
+}
+
+static void aria_gcm_crypt(EVP_ARIA_GCM_CTX *gctx, uint8_t *out,
+                           const uint8_t *in, size_t len, int encrypt) {
+  if (gctx->ares) {
+    // Finalize the GHASH over the AAD before processing message bytes.
+    gctx->gmult(gctx->Xi, gctx->Htable);
+    gctx->ares = 0;
+  }
+  gctx->msg_len += len;
+  unsigned n = gctx->mres;
+  for (size_t i = 0; i < len; i++) {
+    if (n == 0) {
+      ARIA_encrypt_block(gctx->Yi, gctx->EKi, &gctx->ks);
+      aria_gcm_ctr32_inc(gctx->Yi);
+    }
+    uint8_t c = in[i];
+    uint8_t o = c ^ gctx->EKi[n];
+    out[i] = o;
+    // GHASH is computed over the ciphertext in both directions.
+    gctx->Xi[n] ^= encrypt ? o : c;
+    n = (n + 1) % 16;
+    if (n == 0) {
+      gctx->gmult(gctx->Xi, gctx->Htable);
+    }
+  }
+  gctx->mres = n;
+}
+
+// aria_gcm_finalize writes the authentication tag into |gctx->Xi|.
+static void aria_gcm_finalize(EVP_ARIA_GCM_CTX *gctx) {
+  if (gctx->mres || gctx->ares) {
+    gctx->gmult(gctx->Xi, gctx->Htable);
+  }
+  uint8_t len_block[16];
+  CRYPTO_store_u64_be(len_block, gctx->aad_len << 3);
+  CRYPTO_store_u64_be(len_block + 8, gctx->msg_len << 3);
+  CRYPTO_xor16(gctx->Xi, gctx->Xi, len_block);
+  gctx->gmult(gctx->Xi, gctx->Htable);
+  CRYPTO_xor16(gctx->Xi, gctx->Xi, gctx->EK0);
+}
+
+static int aria_gcm_init_key(EVP_CIPHER_CTX *ctx, const uint8_t *key,
+                             const uint8_t *iv, int enc) {
+  EVP_ARIA_GCM_CTX *gctx =
+      reinterpret_cast<EVP_ARIA_GCM_CTX *>(ctx->cipher_data);
+  if (!iv && !key) {
+    return 1;
+  }
+  if (key) {
+    if (ARIA_set_encrypt_key(key, ctx->key_len * 8, &gctx->ks) < 0) {
+      OPENSSL_PUT_ERROR(CIPHER, CIPHER_R_AES_KEY_SETUP_FAILED);
+      return 0;
+    }
+    aria_gcm_setup_key(gctx);
+    if (iv == nullptr && gctx->iv_set) {
+      iv = gctx->iv;
+    }
+    if (iv) {
+      aria_gcm_set_iv(gctx, iv, gctx->ivlen);
+      gctx->iv_set = 1;
+    }
+    gctx->key_set = 1;
+  } else {
+    if (gctx->key_set) {
+      aria_gcm_set_iv(gctx, iv, gctx->ivlen);
+    } else {
+      OPENSSL_memcpy(gctx->iv, iv, gctx->ivlen);
+    }
+    gctx->iv_set = 1;
+    gctx->iv_gen = 0;
+  }
+  return 1;
+}
+
+static void aria_gcm_cleanup(EVP_CIPHER_CTX *c) {
+  EVP_ARIA_GCM_CTX *gctx = reinterpret_cast<EVP_ARIA_GCM_CTX *>(c->cipher_data);
+  OPENSSL_cleanse(&gctx->ks, sizeof(gctx->ks));
+  OPENSSL_cleanse(gctx->Xi, sizeof(gctx->Xi));
+  OPENSSL_cleanse(gctx->EKi, sizeof(gctx->EKi));
+  OPENSSL_cleanse(gctx->EK0, sizeof(gctx->EK0));
+  if (gctx->iv != c->iv) {
+    OPENSSL_free(gctx->iv);
+  }
+}
+
+static int aria_gcm_ctrl(EVP_CIPHER_CTX *c, int type, int arg, void *ptr) {
+  EVP_ARIA_GCM_CTX *gctx = reinterpret_cast<EVP_ARIA_GCM_CTX *>(c->cipher_data);
+  switch (type) {
+    case EVP_CTRL_INIT:
+      gctx->key_set = 0;
+      gctx->iv_set = 0;
+      gctx->ivlen = c->cipher->iv_len;
+      gctx->iv = c->iv;
+      gctx->taglen = -1;
+      gctx->iv_gen = 0;
+      return 1;
+
+    case EVP_CTRL_AEAD_SET_IVLEN:
+      if (arg <= 0) {
+        return 0;
+      }
+      if (arg == gctx->ivlen) {
+        return 1;
+      }
+      gctx->iv_set = 0;
+      gctx->iv_gen = 0;
+      if (arg <= EVP_MAX_IV_LENGTH) {
+        if (gctx->iv != c->iv) {
+          OPENSSL_free(gctx->iv);
+          gctx->iv = c->iv;
+        }
+      } else if (arg > gctx->ivlen) {
+        uint8_t *new_iv = static_cast<uint8_t *>(OPENSSL_malloc(arg));
+        if (new_iv == nullptr) {
+          return 0;
+        }
+        if (gctx->iv != c->iv) {
+          OPENSSL_free(gctx->iv);
+        }
+        gctx->iv = new_iv;
+      }
+      gctx->ivlen = arg;
+      return 1;
+
+    case EVP_CTRL_GET_IVLEN:
+      *(int *)ptr = gctx->ivlen;
+      return 1;
+
+    case EVP_CTRL_AEAD_SET_TAG:
+      if (arg <= 0 || arg > 16 || c->encrypt) {
+        return 0;
+      }
+      OPENSSL_memcpy(c->buf, ptr, arg);
+      gctx->taglen = arg;
+      return 1;
+
+    case EVP_CTRL_AEAD_GET_TAG:
+      if (arg <= 0 || arg > 16 || !c->encrypt || gctx->taglen < 0) {
+        return 0;
+      }
+      OPENSSL_memcpy(ptr, c->buf, arg);
+      return 1;
+
+    case EVP_CTRL_COPY: {
+      EVP_CIPHER_CTX *out = reinterpret_cast<EVP_CIPHER_CTX *>(ptr);
+      EVP_ARIA_GCM_CTX *gctx_out =
+          reinterpret_cast<EVP_ARIA_GCM_CTX *>(out->cipher_data);
+      if (gctx->iv == c->iv) {
+        gctx_out->iv = out->iv;
+      } else {
+        gctx_out->iv =
+            reinterpret_cast<uint8_t *>(OPENSSL_memdup(gctx->iv, gctx->ivlen));
+        if (!gctx_out->iv) {
+          return 0;
+        }
+      }
+      return 1;
+    }
+
+    default:
+      return -1;
+  }
+}
+
+static int aria_gcm_cipher_update(EVP_CIPHER_CTX *ctx, uint8_t *out,
+                                  const uint8_t *in, size_t len) {
+  EVP_ARIA_GCM_CTX *gctx =
+      reinterpret_cast<EVP_ARIA_GCM_CTX *>(ctx->cipher_data);
+  if (!gctx->key_set || !gctx->iv_set) {
+    return 0;
+  }
+  aria_gcm_crypt(gctx, out, in, len, ctx->encrypt);
+  return 1;
+}
+
+static int aria_gcm_cipher_final(EVP_CIPHER_CTX *ctx) {
+  EVP_ARIA_GCM_CTX *gctx =
+      reinterpret_cast<EVP_ARIA_GCM_CTX *>(ctx->cipher_data);
+  if (!gctx->key_set || !gctx->iv_set) {
+    return 0;
+  }
+
+  if (!ctx->encrypt) {
+    if (gctx->taglen < 0) {
+      return 0;
+    }
+    aria_gcm_finalize(gctx);
+    if (CRYPTO_memcmp(gctx->Xi, ctx->buf, gctx->taglen) != 0) {
+      return 0;
+    }
+    gctx->iv_set = 0;
+    return 1;
+  }
+
+  aria_gcm_finalize(gctx);
+  OPENSSL_memcpy(ctx->buf, gctx->Xi, 16);
+  gctx->taglen = 16;
+  gctx->iv_set = 0;
+  return 1;
+}
+
+static int aria_gcm_update_aad(EVP_CIPHER_CTX *ctx, const uint8_t *in,
+                               size_t len) {
+  EVP_ARIA_GCM_CTX *gctx =
+      reinterpret_cast<EVP_ARIA_GCM_CTX *>(ctx->cipher_data);
+  if (!gctx->key_set || !gctx->iv_set) {
+    return 0;
+  }
+  aria_gcm_aad(gctx, in, len);
+  return 1;
+}
+
+#define DEFINE_ARIA_GCM_CIPHER(name, nid_val, klen)                          \
+  DEFINE_METHOD_FUNCTION(EVP_CIPHER, name) {                                 \
+    memset(out, 0, sizeof(EVP_CIPHER));                                      \
+    out->nid = (nid_val);                                                    \
+    out->block_size = 1;                                                     \
+    out->key_len = (klen);                                                   \
+    out->iv_len = ARIA_GCM_NONCE_LENGTH;                                     \
+    out->ctx_size = sizeof(EVP_ARIA_GCM_CTX);                                \
+    out->flags = EVP_CIPH_GCM_MODE | EVP_CIPH_CUSTOM_IV |                    \
+                 EVP_CIPH_CUSTOM_COPY | EVP_CIPH_FLAG_CUSTOM_CIPHER |        \
+                 EVP_CIPH_ALWAYS_CALL_INIT | EVP_CIPH_CTRL_INIT |           \
+                 EVP_CIPH_FLAG_AEAD_CIPHER;                                  \
+    out->init = aria_gcm_init_key;                                           \
+    out->cipher_update = aria_gcm_cipher_update;                            \
+    out->cipher_final = aria_gcm_cipher_final;                              \
+    out->update_aad = aria_gcm_update_aad;                                   \
+    out->cleanup = aria_gcm_cleanup;                                         \
+    out->ctrl = aria_gcm_ctrl;                                               \
+  }
+
 #define DEFINE_ARIA_CIPHER(name, nid_val, klen, ivlen, blocksize, mode, \
                            update_fn)                                   \
   DEFINE_METHOD_FUNCTION(EVP_CIPHER, name) {                            \
@@ -144,3 +476,7 @@ DEFINE_ARIA_CIPHER(EVP_aria_256_cbc, NID_aria_256_cbc, 32, 16, 16,
                    EVP_CIPH_CBC_MODE, aria_cbc_cipher_update)
 DEFINE_ARIA_CIPHER(EVP_aria_256_ctr, NID_aria_256_ctr, 32, 16, 1,
                    EVP_CIPH_CTR_MODE, aria_ctr_cipher_update)
+
+DEFINE_ARIA_GCM_CIPHER(EVP_aria_128_gcm, NID_aria_128_gcm, 16)
+DEFINE_ARIA_GCM_CIPHER(EVP_aria_192_gcm, NID_aria_192_gcm, 24)
+DEFINE_ARIA_GCM_CIPHER(EVP_aria_256_gcm, NID_aria_256_gcm, 32)

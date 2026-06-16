@@ -72,6 +72,9 @@ OPENSSL_EXPORT const EVP_CIPHER *EVP_aria_192_ctr(void);
 OPENSSL_EXPORT const EVP_CIPHER *EVP_aria_256_ecb(void);
 OPENSSL_EXPORT const EVP_CIPHER *EVP_aria_256_cbc(void);
 OPENSSL_EXPORT const EVP_CIPHER *EVP_aria_256_ctr(void);
+OPENSSL_EXPORT const EVP_CIPHER *EVP_aria_128_gcm(void);
+OPENSSL_EXPORT const EVP_CIPHER *EVP_aria_192_gcm(void);
+OPENSSL_EXPORT const EVP_CIPHER *EVP_aria_256_gcm(void);
 
 
 #if defined(__cplusplus)

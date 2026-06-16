@@ -5528,6 +5528,12 @@ extern "C" {
 #define NID_aria_256_cbc 1076
 #define SN_aria_256_ctr "ARIA-256-CTR"
 #define NID_aria_256_ctr 1079
+#define SN_aria_128_gcm "ARIA-128-GCM"
+#define NID_aria_128_gcm 1124
+#define SN_aria_192_gcm "ARIA-192-GCM"
+#define NID_aria_192_gcm 1125
+#define SN_aria_256_gcm "ARIA-256-GCM"
+#define NID_aria_256_gcm 1126
 
 #define SN_X_Wing "X-Wing"
 #define NID_X_Wing 972
