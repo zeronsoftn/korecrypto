@@ -91,6 +91,7 @@ set(
   crypto/fipsmodule/hkdf/hkdf.cc.inc
   crypto/fipsmodule/hmac/hmac.cc.inc
   crypto/fipsmodule/kdf/kbkdf.cc.inc
+  crypto/fipsmodule/rand/drbg90a.cc.inc
   crypto/fipsmodule/keccak/keccak.cc.inc
   crypto/fipsmodule/keccak/e_sha3.cc.inc
   crypto/fipsmodule/mldsa/fips_known_values.inc
@@ -573,6 +574,7 @@ set(
   include/openssl/hight.h
   include/openssl/lsh.h
   include/openssl/kbkdf.h
+  include/openssl/drbg_kcmvp.h
   include/openssl/arm_arch.h
   include/openssl/asm_base.h
   include/openssl/asn1.h
