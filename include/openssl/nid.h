@@ -5535,6 +5535,33 @@ extern "C" {
 #define SN_aria_256_gcm "ARIA-256-GCM"
 #define NID_aria_256_gcm 1126
 
+// LEA (KS X 3246 / ISO 29192-2), a KCMVP validation-target block cipher. LEA
+// has no OpenSSL NID assignment, so a private range is used here.
+#define SN_lea_128_ecb "LEA-128-ECB"
+#define NID_lea_128_ecb 2001
+#define SN_lea_128_cbc "LEA-128-CBC"
+#define NID_lea_128_cbc 2002
+#define SN_lea_128_ctr "LEA-128-CTR"
+#define NID_lea_128_ctr 2003
+#define SN_lea_128_gcm "LEA-128-GCM"
+#define NID_lea_128_gcm 2004
+#define SN_lea_192_ecb "LEA-192-ECB"
+#define NID_lea_192_ecb 2005
+#define SN_lea_192_cbc "LEA-192-CBC"
+#define NID_lea_192_cbc 2006
+#define SN_lea_192_ctr "LEA-192-CTR"
+#define NID_lea_192_ctr 2007
+#define SN_lea_192_gcm "LEA-192-GCM"
+#define NID_lea_192_gcm 2008
+#define SN_lea_256_ecb "LEA-256-ECB"
+#define NID_lea_256_ecb 2009
+#define SN_lea_256_cbc "LEA-256-CBC"
+#define NID_lea_256_cbc 2010
+#define SN_lea_256_ctr "LEA-256-CTR"
+#define NID_lea_256_ctr 2011
+#define SN_lea_256_gcm "LEA-256-GCM"
+#define NID_lea_256_gcm 2012
+
 #define SN_X_Wing "X-Wing"
 #define NID_X_Wing 972
 

@@ -34,6 +34,7 @@ set(
   crypto/fipsmodule/aes/mode_wrappers.cc.inc
   crypto/fipsmodule/aes/ofb.cc.inc
   crypto/fipsmodule/aria/aria.cc.inc
+  crypto/fipsmodule/lea/lea.cc.inc
   crypto/fipsmodule/bn/add.cc.inc
   crypto/fipsmodule/bn/asm/x86_64-gcc.cc.inc
   crypto/fipsmodule/bn/bn.cc.inc
@@ -60,6 +61,7 @@ set(
   crypto/fipsmodule/cipher/e_aes.cc.inc
   crypto/fipsmodule/cipher/e_aesccm.cc.inc
   crypto/fipsmodule/cipher/e_aria.cc.inc
+  crypto/fipsmodule/cipher/e_lea.cc.inc
   crypto/fipsmodule/cmac/cmac.cc.inc
   crypto/fipsmodule/dh/check.cc.inc
   crypto/fipsmodule/dh/dh.cc.inc
@@ -559,6 +561,7 @@ set(
   include/openssl/aead.h
   include/openssl/aes.h
   include/openssl/aria.h
+  include/openssl/lea.h
   include/openssl/arm_arch.h
   include/openssl/asm_base.h
   include/openssl/asn1.h
