@@ -109,6 +109,8 @@ OPENSSL_CLANG_PRAGMA("clang diagnostic ignored \"-Wheader-hygiene\"")
 #include "hmac/hmac.cc.inc"
 #include "kdf/kbkdf.cc.inc"
 #include "rand/drbg90a.cc.inc"
+#include "eckcdsa/eckcdsa.cc.inc"
+#include "kcdsa/kcdsa.cc.inc"
 #include "keccak/keccak.cc.inc"
 #include "keccak/e_sha3.cc.inc"
 #include "mldsa/mldsa.cc.inc"
