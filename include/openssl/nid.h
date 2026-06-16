@@ -5562,6 +5562,23 @@ extern "C" {
 #define SN_lea_256_gcm "LEA-256-GCM"
 #define NID_lea_256_gcm 2012
 
+// SEED (KS X 1213-1 / RFC 4269) and HIGHT (KS X 1213-2), KCMVP validation-
+// target block ciphers. Private NID range.
+#define SN_seed_ecb "SEED-ECB"
+#define NID_seed_ecb 2101
+#define SN_seed_cbc "SEED-CBC"
+#define NID_seed_cbc 2102
+#define SN_seed_ctr "SEED-CTR"
+#define NID_seed_ctr 2103
+#define SN_seed_gcm "SEED-GCM"
+#define NID_seed_gcm 2104
+#define SN_hight_ecb "HIGHT-ECB"
+#define NID_hight_ecb 2105
+#define SN_hight_cbc "HIGHT-CBC"
+#define NID_hight_cbc 2106
+#define SN_hight_ctr "HIGHT-CTR"
+#define NID_hight_ctr 2107
+
 #define SN_X_Wing "X-Wing"
 #define NID_X_Wing 972
 

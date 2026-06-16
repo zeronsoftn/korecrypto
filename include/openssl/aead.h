@@ -194,6 +194,10 @@ OPENSSL_EXPORT const EVP_AEAD *EVP_aead_lea_128_ccm(void);
 OPENSSL_EXPORT const EVP_AEAD *EVP_aead_lea_192_ccm(void);
 OPENSSL_EXPORT const EVP_AEAD *EVP_aead_lea_256_ccm(void);
 
+// EVP_aead_seed_ccm is SEED-CCM (a KCMVP validation-target AEAD) with M=16
+// (16-byte tags) and L=3 (12-byte nonces).
+OPENSSL_EXPORT const EVP_AEAD *EVP_aead_seed_ccm(void);
+
 // EVP_has_aes_hardware returns one if we enable hardware support for fast and
 // constant-time AES-GCM.
 OPENSSL_EXPORT int EVP_has_aes_hardware(void);
