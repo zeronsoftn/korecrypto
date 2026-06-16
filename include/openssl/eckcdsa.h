@@ -43,6 +43,11 @@ OPENSSL_EXPORT void EC_KCDSA_KEY_free(EC_KCDSA_KEY *key);
 OPENSSL_EXPORT int EC_KCDSA_KEY_set_private(EC_KCDSA_KEY *key, const uint8_t *d,
                                             size_t d_len);
 
+// EC_KCDSA_KEY_generate 는 개인키 d 를 [1, n-1] 에서 무작위 생성하고 공개키를
+// 계산한 뒤, 키쌍 일치시험(PCT)을 수행한다(KCMVP 조건부 자가시험). PCT 실패 시
+// 키를 폐기하고 0 을 반환한다. 성공 시 1.
+OPENSSL_EXPORT int EC_KCDSA_KEY_generate(EC_KCDSA_KEY *key);
+
 // EC_KCDSA_KEY_set_public 는 검증용으로 공개키 좌표(빅엔디안)를 직접 설정한다.
 OPENSSL_EXPORT int EC_KCDSA_KEY_set_public(EC_KCDSA_KEY *key, const uint8_t *qx,
                                            size_t qx_len, const uint8_t *qy,

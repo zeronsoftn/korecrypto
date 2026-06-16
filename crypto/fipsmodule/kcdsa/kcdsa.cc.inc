@@ -362,3 +362,83 @@ err:
 }
 
 }  // extern "C"
+
+namespace {
+
+// kcdsa_md_for_len 은 |Q| 바이트 길이에 맞는 해시(SHA-224/256)를 반환한다.
+const EVP_MD *kcdsa_md_for_len(size_t q_bytes) {
+  if (q_bytes == 28) {
+    return EVP_sha224();
+  }
+  if (q_bytes == 32) {
+    return EVP_sha256();
+  }
+  return nullptr;
+}
+
+// kcdsa_pct 는 키쌍 일치시험(PCT)을 수행한다(KCMVP 조건부 자가시험).
+int kcdsa_pct(const KCDSA_KEY *key, const EVP_MD *md) {
+  static const uint8_t kMsg[] = "KCMVP KCDSA pairwise consistency test";
+  uint8_t sig[128];
+  size_t sig_len = 0;
+  if (!KCDSA_sign(key, md, kMsg, sizeof(kMsg), nullptr, 0, sig, &sig_len)) {
+    return 0;
+  }
+  return KCDSA_verify(key, md, kMsg, sizeof(kMsg), sig, sig_len);
+}
+
+}  // namespace
+
+extern "C" {
+
+int KCDSA_KEY_generate(KCDSA_KEY *key) {
+  if (key == nullptr || key->p == nullptr || key->q == nullptr ||
+      key->g == nullptr) {
+    return 0;
+  }
+  const EVP_MD *md = kcdsa_md_for_len(BN_num_bytes(key->q));
+  if (md == nullptr) {
+    return 0;
+  }
+
+  int ret = 0;
+  BN_CTX *ctx = BN_CTX_new();
+  BIGNUM *x = BN_new();
+  BIGNUM *x_inv = BN_new();
+  BIGNUM *y = BN_new();
+  if (ctx == nullptr || x == nullptr || x_inv == nullptr || y == nullptr) {
+    goto err;
+  }
+
+  // 개인키 x 를 [1, Q-1] 에서 무작위 생성하고 y = G^{x^{-1} mod Q} mod P 계산.
+  if (!BN_rand_range_ex(x, 1, key->q) ||
+      BN_mod_inverse(x_inv, x, key->q, ctx) == nullptr ||
+      !BN_mod_exp(y, key->g, x_inv, key->p, ctx)) {
+    goto err;
+  }
+  BN_clear_free(key->x);
+  key->x = x;
+  x = nullptr;
+  BN_free(key->y);
+  key->y = y;
+  y = nullptr;
+
+  // 키쌍 일치시험(PCT). 실패 시 키를 폐기한다.
+  if (!kcdsa_pct(key, md)) {
+    BN_clear_free(key->x);
+    key->x = nullptr;
+    BN_free(key->y);
+    key->y = nullptr;
+    goto err;
+  }
+  ret = 1;
+
+err:
+  BN_clear_free(x);
+  BN_free(x_inv);
+  BN_free(y);
+  BN_CTX_free(ctx);
+  return ret;
+}
+
+}  // extern "C"
