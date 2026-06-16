@@ -5508,6 +5508,27 @@ extern "C" {
 #define OBJ_ML_KEM_768 2L, 16L, 840L, 1L, 101L, 3L, 4L, 4L, 2L
 #define OBJ_ENC_ML_KEM_768 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x04, 0x02
 
+// ARIA (KS X 1213 / RFC 5794), a KCMVP validation-target block cipher. NID
+// values match OpenSSL's assignments for cross-compatibility.
+#define SN_aria_128_ecb "ARIA-128-ECB"
+#define NID_aria_128_ecb 1065
+#define SN_aria_128_cbc "ARIA-128-CBC"
+#define NID_aria_128_cbc 1066
+#define SN_aria_128_ctr "ARIA-128-CTR"
+#define NID_aria_128_ctr 1069
+#define SN_aria_192_ecb "ARIA-192-ECB"
+#define NID_aria_192_ecb 1070
+#define SN_aria_192_cbc "ARIA-192-CBC"
+#define NID_aria_192_cbc 1071
+#define SN_aria_192_ctr "ARIA-192-CTR"
+#define NID_aria_192_ctr 1074
+#define SN_aria_256_ecb "ARIA-256-ECB"
+#define NID_aria_256_ecb 1075
+#define SN_aria_256_cbc "ARIA-256-CBC"
+#define NID_aria_256_cbc 1076
+#define SN_aria_256_ctr "ARIA-256-CTR"
+#define NID_aria_256_ctr 1079
+
 #define SN_X_Wing "X-Wing"
 #define NID_X_Wing 972
 
