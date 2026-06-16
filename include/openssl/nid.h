@@ -5593,6 +5593,16 @@ extern "C" {
 #define SN_lsh512_512 "LSH-512-512"
 #define NID_lsh512_512 2206
 
+// SHA-3 (FIPS 202), a KCMVP validation-target hash. NID values match OpenSSL.
+#define SN_sha3_224 "SHA3-224"
+#define NID_sha3_224 1096
+#define SN_sha3_256 "SHA3-256"
+#define NID_sha3_256 1097
+#define SN_sha3_384 "SHA3-384"
+#define NID_sha3_384 1098
+#define SN_sha3_512 "SHA3-512"
+#define NID_sha3_512 1099
+
 #define SN_X_Wing "X-Wing"
 #define NID_X_Wing 972
 

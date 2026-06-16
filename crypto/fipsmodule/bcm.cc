@@ -108,6 +108,7 @@ OPENSSL_CLANG_PRAGMA("clang diagnostic ignored \"-Wheader-hygiene\"")
 #include "hkdf/hkdf.cc.inc"
 #include "hmac/hmac.cc.inc"
 #include "keccak/keccak.cc.inc"
+#include "keccak/e_sha3.cc.inc"
 #include "mldsa/mldsa.cc.inc"
 #include "mlkem/mlkem.cc.inc"
 #include "rand/android_entropy_client.cc.inc"
