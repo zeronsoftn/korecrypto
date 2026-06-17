@@ -206,14 +206,15 @@ int KCDSA_sign(const KCDSA_KEY *key, const EVP_MD *md, const uint8_t *msg,
   }
   size_t q_bytes = BN_num_bytes(key->q);
   size_t md_len = EVP_MD_size(md);
-  // 다이제스트 길이와 |Q| 바이트 길이가 일치해야 한다(SHA-224/q224, SHA-256/q256).
-  if (q_bytes == 0 || md_len != q_bytes) {
+  // 다이제스트 길이는 |Q| 이상이어야 한다(같으면 절단 없음, 크면 절단).
+  if (q_bytes == 0 || md_len > 64 || md_len < q_bytes) {
     return 0;
   }
+  size_t count = md_len - q_bytes;
 
   int ret = 0;
   size_t p_bytes = BN_num_bytes(key->p);
-  uint8_t r[64], h[64], k_rand[64];
+  uint8_t r[64], h[64], k_rand[64], e_buf[64];
   uint8_t *w_buf = reinterpret_cast<uint8_t *>(OPENSSL_malloc(p_bytes));
   BN_CTX *ctx = BN_CTX_new();
   BIGNUM *k = BN_new();
@@ -253,14 +254,14 @@ int KCDSA_sign(const KCDSA_KEY *key, const EVP_MD *md, const uint8_t *msg,
     goto err;
   }
 
-  // R 을 서명 앞부분에 저장 (이후 r 은 xor 로 덮어쓴다)
-  OPENSSL_memcpy(sig, r, q_bytes);
+  // R = Hash(W) 의 하위 |Q|바이트를 서명 앞부분에 저장.
+  OPENSSL_memcpy(sig, r + count, q_bytes);
 
-  // step 4. E = (R xor H) mod Q
+  // step 4. E = (R xor H) mod Q. 절단 시 H 의 하위 |Q|바이트(h[count..]) 사용.
   for (size_t i = 0; i < q_bytes; i++) {
-    r[i] ^= h[i];
+    e_buf[i] = r[count + i] ^ h[count + i];
   }
-  if (BN_bin2bn(r, q_bytes, r_bn) == nullptr ||
+  if (BN_bin2bn(e_buf, q_bytes, r_bn) == nullptr ||
       !BN_nnmod(e, r_bn, key->q, ctx)) {
     goto err;
   }
@@ -295,13 +296,15 @@ int KCDSA_verify(const KCDSA_KEY *key, const EVP_MD *md, const uint8_t *msg,
   }
   size_t q_bytes = BN_num_bytes(key->q);
   size_t md_len = EVP_MD_size(md);
-  if (q_bytes == 0 || md_len != q_bytes || sig_len != 2 * q_bytes) {
+  // 다이제스트 길이는 |Q| 이상이어야 한다(같으면 절단 없음, 크면 절단).
+  if (q_bytes == 0 || md_len > 64 || md_len < q_bytes || sig_len != 2 * q_bytes) {
     return 0;
   }
+  size_t count = md_len - q_bytes;  // |Q|<해시 시 해시 상위 절단 길이
 
   int ret = 0;
   size_t p_bytes = BN_num_bytes(key->p);
-  uint8_t h[64], r_check[64];
+  uint8_t h[64], r_check[64], e_buf[64];
   const uint8_t *R = sig;
   const uint8_t *S = sig + q_bytes;
   uint8_t *w_buf = reinterpret_cast<uint8_t *>(OPENSSL_malloc(p_bytes));
@@ -328,11 +331,11 @@ int KCDSA_verify(const KCDSA_KEY *key, const EVP_MD *md, const uint8_t *msg,
     goto err;
   }
 
-  // E' = (R' xor H') mod Q
+  // E' = (R' xor H') mod Q. 절단 시 H' 의 하위 |Q|바이트(h[count..])를 사용.
   for (size_t i = 0; i < q_bytes; i++) {
-    h[i] ^= R[i];
+    e_buf[i] = R[i] ^ h[count + i];
   }
-  if (BN_bin2bn(h, q_bytes, r_bn) == nullptr ||
+  if (BN_bin2bn(e_buf, q_bytes, r_bn) == nullptr ||
       !BN_nnmod(e, r_bn, key->q, ctx)) {
     goto err;
   }
@@ -346,8 +349,8 @@ int KCDSA_verify(const KCDSA_KEY *key, const EVP_MD *md, const uint8_t *msg,
     goto err;
   }
 
-  // Hash(W') == R' 확인 (상수시간 비교)
-  ret = CRYPTO_memcmp(r_check, R, q_bytes) == 0;
+  // Hash(W') 의 하위 |Q|바이트 == R' 확인 (상수시간 비교)
+  ret = CRYPTO_memcmp(r_check + count, R, q_bytes) == 0;
 
 err:
   OPENSSL_free(w_buf);

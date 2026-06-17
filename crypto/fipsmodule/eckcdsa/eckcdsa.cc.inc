@@ -222,11 +222,13 @@ int EC_KCDSA_sign(const EC_KCDSA_KEY *key, const EVP_MD *md, const uint8_t *msg,
     return 0;
   }
   size_t L = EC_KCDSA_coord_len(key);
-  // 좌표 길이와 다이제스트 길이가 일치해야 한다(P-224/SHA-224, P-256/SHA-256).
-  if (L == 0 || L > 64 || EVP_MD_size(md) != L) {
+  size_t dlen = EVP_MD_size(md);
+  // 다이제스트 길이는 좌표 길이 이상이어야 한다(같으면 절단 없음, 크면 절단).
+  if (L == 0 || dlen > 64 || dlen < L) {
     OPENSSL_PUT_ERROR(EC, EC_R_INVALID_PRIVATE_KEY);
     return 0;
   }
+  size_t count = dlen - L;  // 곡선≠해시 시 r/v 상위 바이트 절단 길이
 
   int ret = 0;
   uint8_t r[64], v[64], x1_bytes[64];
@@ -276,17 +278,21 @@ int EC_KCDSA_sign(const EC_KCDSA_KEY *key, const EVP_MD *md, const uint8_t *msg,
     goto err;
   }
 
-  // step 4. E = (R xor V) mod n
-  for (size_t i = 0; i < L; i++) {
+  // 서명의 R 부분 = 다이제스트의 하위 L바이트(절단 전 원본).
+  OPENSSL_memcpy(sig, r + count, L);
+
+  // step 4. E = (R xor V) mod n. 곡선≠해시 시 r/v 의 상위 count바이트를 0으로
+  // 만든 뒤 다이제스트 길이(dlen)만큼 xor 한다.
+  if (count > 0) {
+    OPENSSL_memset(r, 0, count);
+    OPENSSL_memset(v, 0, count);
+  }
+  for (size_t i = 0; i < dlen; i++) {
     r[i] ^= v[i];
   }
-  if (BN_bin2bn(r, L, r_xor_v) == nullptr ||
+  if (BN_bin2bn(r, dlen, r_xor_v) == nullptr ||
       !BN_nnmod(e, r_xor_v, order, ctx)) {
     goto err;
-  }
-  // R 을 복원해 서명 앞부분에 기록 (r 버퍼는 xor 로 덮였으므로 재계산)
-  for (size_t i = 0; i < L; i++) {
-    r[i] ^= v[i];
   }
 
   // step 5. S = d·(k - E) mod n
@@ -295,7 +301,6 @@ int EC_KCDSA_sign(const EC_KCDSA_KEY *key, const EVP_MD *md, const uint8_t *msg,
     goto err;
   }
 
-  OPENSSL_memcpy(sig, r, L);
   if (!BN_bn2bin_padded(sig + L, L, s)) {
     goto err;
   }
@@ -321,12 +326,14 @@ int EC_KCDSA_verify(const EC_KCDSA_KEY *key, const EVP_MD *md,
     return 0;
   }
   size_t L = EC_KCDSA_coord_len(key);
-  if (L == 0 || L > 64 || EVP_MD_size(md) != L || sig_len != 2 * L) {
+  size_t dlen = EVP_MD_size(md);
+  if (L == 0 || dlen > 64 || dlen < L || sig_len != 2 * L) {
     return 0;
   }
+  size_t count = dlen - L;
 
   int ret = 0;
-  uint8_t v[64], r_check[64], x2_bytes[64];
+  uint8_t v[64], r_check[64], x2_bytes[64], rr[64];
   const uint8_t *R = sig;
   const uint8_t *S = sig + L;
   BN_CTX *ctx = BN_CTX_new();
@@ -348,16 +355,23 @@ int EC_KCDSA_verify(const EC_KCDSA_KEY *key, const EVP_MD *md,
     goto err;
   }
 
+  // R' 을 dlen바이트로 0-확장(상위 count바이트 0, 하위 L바이트=R').
+  OPENSSL_memset(rr, 0, dlen);
+  OPENSSL_memcpy(rr + count, R, L);
+
   // V' = Hash(C_Q || M)
   if (!eckcdsa_compute_v(key, md, L, msg, msg_len, v)) {
     goto err;
   }
-
-  // E' = (R' xor V') mod n
-  for (size_t i = 0; i < L; i++) {
-    v[i] ^= R[i];
+  if (count > 0) {
+    OPENSSL_memset(v, 0, count);
   }
-  if (BN_bin2bn(v, L, r_xor_v) == nullptr ||
+
+  // E' = (R' xor V') mod n  (dlen바이트)
+  for (size_t i = 0; i < dlen; i++) {
+    v[i] ^= rr[i];
+  }
+  if (BN_bin2bn(v, dlen, r_xor_v) == nullptr ||
       !BN_nnmod(e, r_xor_v, order, ctx)) {
     goto err;
   }
@@ -370,9 +384,12 @@ int EC_KCDSA_verify(const EC_KCDSA_KEY *key, const EVP_MD *md,
       !eckcdsa_hash(md, x2_bytes, L, r_check)) {
     goto err;
   }
+  if (count > 0) {
+    OPENSSL_memset(r_check, 0, count);
+  }
 
-  // Hash(x2) == R' 확인 (상수시간 비교)
-  ret = CRYPTO_memcmp(r_check, R, L) == 0;
+  // Hash(x2) == R' 확인 (dlen바이트 상수시간 비교)
+  ret = CRYPTO_memcmp(r_check, rr, dlen) == 0;
 
 err:
   BN_free(e);
