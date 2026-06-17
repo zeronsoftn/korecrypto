@@ -69,7 +69,8 @@ int kbkdf_hmac(const EVP_MD *md, const uint8_t *ki, size_t ki_len,
   if (out_len == 0) {
     return 1;
   }
-  if (counter_bytes < 1 || counter_bytes > 4) {
+  // counter_bytes==0 은 피드백 모드의 [NO COUNTER] 변형(카운터 미삽입)에 쓰인다.
+  if (counter_bytes > 4) {
     return 0;
   }
 
@@ -160,6 +161,102 @@ err:
   return ret;
 }
 
+// kbkdf_hmac_dpi 는 SP 800-108 이중 파이프라인(double-pipeline) 모드.
+//   fixed = Label || 0x00 || Context || [L]
+//   A(0) = fixed,  A(i) = HMAC(KI, A(i-1))
+//   K(i) = HMAC(KI, A(i) || [i]_r || fixed)   ([i] 는 counter_bytes>0 일 때만)
+int kbkdf_hmac_dpi(const EVP_MD *md, const uint8_t *ki, size_t ki_len,
+                   unsigned counter_bytes, const uint8_t *label,
+                   size_t label_len, const uint8_t *context,
+                   size_t context_len, uint8_t *out, size_t out_len) {
+  if (out_len == 0) {
+    return 1;
+  }
+  if (counter_bytes > 4) {
+    return 0;
+  }
+  const size_t h = EVP_MD_size(md);
+  if (h == 0 || out_len > (SIZE_MAX / 8)) {
+    return 0;
+  }
+  const uint32_t l_bits = (uint32_t)(out_len * 8);
+  uint8_t l_param[4];
+  size_t l_len = kbkdf_add_l_param(l_param, l_bits);
+  size_t fixed_len = label_len + 1 + context_len + l_len;
+
+  int ret = 0;
+  uint8_t *fixed = reinterpret_cast<uint8_t *>(OPENSSL_malloc(fixed_len));
+  uint8_t *kin =
+      reinterpret_cast<uint8_t *>(OPENSSL_malloc(h + counter_bytes + fixed_len));
+  if (fixed == nullptr || kin == nullptr) {
+    goto err;
+  }
+  // fixed = Label || 0x00 || Context || [L]
+  if (label_len != 0) {
+    OPENSSL_memcpy(fixed, label, label_len);
+  }
+  fixed[label_len] = 0x00;
+  if (context_len != 0) {
+    OPENSSL_memcpy(fixed + label_len + 1, context, context_len);
+  }
+  OPENSSL_memcpy(fixed + label_len + 1 + context_len, l_param, l_len);
+
+  {
+    uint8_t a[EVP_MAX_MD_SIZE], block[EVP_MAX_MD_SIZE];
+    size_t done = 0;
+    uint32_t ctr = 0;
+    unsigned mac_len = 0;
+    int first = 1;
+    while (done < out_len) {
+      ctr++;
+      // A(i) = HMAC(KI, A(i-1)). A(0)=fixed → 첫 회는 fixed 입력.
+      if (first) {
+        if (HMAC(md, ki, ki_len, fixed, fixed_len, a, &mac_len) == nullptr) {
+          goto err;
+        }
+        first = 0;
+      } else {
+        uint8_t tmp[EVP_MAX_MD_SIZE];
+        if (HMAC(md, ki, ki_len, a, h, tmp, &mac_len) == nullptr) {
+          goto err;
+        }
+        OPENSSL_memcpy(a, tmp, h);
+      }
+      // K(i) = HMAC(KI, A(i) || [i]_r || fixed)
+      uint8_t *p = kin;
+      OPENSSL_memcpy(p, a, h);
+      p += h;
+      kbkdf_put_counter(p, ctr, counter_bytes);
+      p += counter_bytes;
+      OPENSSL_memcpy(p, fixed, fixed_len);
+      if (HMAC(md, ki, ki_len, kin, h + counter_bytes + fixed_len, block,
+               &mac_len) == nullptr ||
+          mac_len != h) {
+        goto err;
+      }
+      size_t take = out_len - done < h ? out_len - done : h;
+      OPENSSL_memcpy(out + done, block, take);
+      done += take;
+    }
+    OPENSSL_cleanse(a, sizeof(a));
+    OPENSSL_cleanse(block, sizeof(block));
+  }
+  ret = 1;
+
+err:
+  if (fixed != nullptr) {
+    OPENSSL_free(fixed);
+  }
+  if (kin != nullptr) {
+    OPENSSL_cleanse(kin, h + counter_bytes + fixed_len);
+    OPENSSL_free(kin);
+  }
+  if (!ret) {
+    OPENSSL_cleanse(out, out_len);
+  }
+  return ret;
+}
+
 }  // namespace
 
 extern "C" {
@@ -179,6 +276,15 @@ int KBKDF_hmac_feedback(const EVP_MD *md, const uint8_t *ki, size_t ki_len,
                         uint8_t *out, size_t out_len) {
   return kbkdf_hmac(md, ki, ki_len, counter_bytes, label, label_len, context,
                     context_len, iv, iv_len, /*feedback=*/1, out, out_len);
+}
+
+int KBKDF_hmac_double_pipeline(const EVP_MD *md, const uint8_t *ki,
+                               size_t ki_len, unsigned counter_bytes,
+                               const uint8_t *label, size_t label_len,
+                               const uint8_t *context, size_t context_len,
+                               uint8_t *out, size_t out_len) {
+  return kbkdf_hmac_dpi(md, ki, ki_len, counter_bytes, label, label_len,
+                        context, context_len, out, out_len);
 }
 
 }  // extern "C"

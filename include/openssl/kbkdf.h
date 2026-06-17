@@ -55,6 +55,15 @@ OPENSSL_EXPORT int KBKDF_hmac_feedback(const EVP_MD *md, const uint8_t *ki,
                                        size_t iv_len, uint8_t *out,
                                        size_t out_len);
 
+// KBKDF_hmac_double_pipeline derives |out_len| bytes into |out| using SP 800-108
+// double-pipeline mode and an HMAC PRF over |md|. |counter_bytes| 0 omits the
+// counter (the [NO COUNTER] variant). It returns one on success and zero on
+// error.
+OPENSSL_EXPORT int KBKDF_hmac_double_pipeline(
+    const EVP_MD *md, const uint8_t *ki, size_t ki_len, unsigned counter_bytes,
+    const uint8_t *label, size_t label_len, const uint8_t *context,
+    size_t context_len, uint8_t *out, size_t out_len);
+
 
 #if defined(__cplusplus)
 }  // extern C
