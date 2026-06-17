@@ -133,7 +133,10 @@ OPENSSL_EXPORT int EVP_DigestUpdate(EVP_MD_CTX *ctx, const void *data,
 
 // EVP_MAX_MD_BLOCK_SIZE is the largest digest block size supported, in
 // bytes.
-#define EVP_MAX_MD_BLOCK_SIZE 128  // SHA-512 is the longest so far.
+// KCMVP: LSH-512 의 메시지 블록은 256바이트로, HMAC 의 pad/key_block 버퍼가
+// 이 값으로 잡힌다. LSH-512(및 SHA3-224/256, 블록 144/136) 기반 HMAC 에서
+// 스택 버퍼 오버플로를 막기 위해 128→256 으로 상향한다.
+#define EVP_MAX_MD_BLOCK_SIZE 256  // LSH-512 block is 256 bytes.
 
 // EVP_DigestFinal_ex finishes the digest in `ctx` and writes the output to
 // `md_out`. `EVP_MD_CTX_size` bytes are written, which is at most
