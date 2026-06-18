@@ -149,6 +149,33 @@ size_t KCDSA_sig_len(const KCDSA_KEY *key) {
   return 2 * BN_num_bytes(key->q);
 }
 
+// kcdsa_bn_out 은 |bn| 을 빅엔디안으로 |out| 에 기록하고 길이를 반환한다.
+static int kcdsa_bn_out(const BIGNUM *bn, uint8_t *out, size_t max_out,
+                        size_t *out_len) {
+  if (bn == nullptr) {
+    return 0;
+  }
+  size_t n = BN_num_bytes(bn);
+  if (n > max_out) {
+    return 0;
+  }
+  *out_len = n;
+  return BN_bn2bin_padded(out, n, bn);
+}
+
+int KCDSA_KEY_get_params(const KCDSA_KEY *key, uint8_t *p, size_t p_max,
+                         size_t *p_len, uint8_t *q, size_t q_max, size_t *q_len,
+                         uint8_t *g, size_t g_max, size_t *g_len) {
+  return kcdsa_bn_out(key->p, p, p_max, p_len) &&
+         kcdsa_bn_out(key->q, q, q_max, q_len) &&
+         kcdsa_bn_out(key->g, g, g_max, g_len);
+}
+
+int KCDSA_KEY_get_private(const KCDSA_KEY *key, uint8_t *out, size_t max_out,
+                          size_t *out_len) {
+  return kcdsa_bn_out(key->x, out, max_out, out_len);
+}
+
 }  // extern "C"
 
 namespace {
@@ -440,6 +467,218 @@ err:
   BN_clear_free(x);
   BN_free(x_inv);
   BN_free(y);
+  BN_CTX_free(ctx);
+  return ret;
+}
+
+}  // extern "C"
+
+namespace {
+
+// kcdsa_ppgf 는 TTAK.KO-12.0001 의 일방향 함수 PPGF 를 구현한다.
+// 출력 dst 는 ceil(out_bits/8) 바이트(빅엔디안). Count(1바이트)=0,1,.. 마다
+// digest = Hash(src || Count) 를 출력 버퍼의 끝(최하위)부터 앞쪽으로 채우고,
+// 마지막에 최상위 바이트를 out_bits 에 맞게 마스크한다.
+int kcdsa_ppgf(const EVP_MD *md, const uint8_t *src, size_t src_len,
+               uint8_t *dst, size_t out_bits) {
+  size_t dlen = EVP_MD_size(md);
+  size_t total = (out_bits + 7) / 8;
+  uint8_t *buf = reinterpret_cast<uint8_t *>(OPENSSL_malloc(src_len + 1));
+  if (buf == nullptr) {
+    return 0;
+  }
+  OPENSSL_memcpy(buf, src, src_len);
+
+  int ok = 1;
+  size_t i = total;
+  uint8_t count = 0;
+  uint8_t digest[EVP_MAX_MD_SIZE];
+  for (;;) {
+    buf[src_len] = count++;
+    unsigned dl = 0;
+    if (!EVP_Digest(buf, src_len + 1, digest, &dl, md, nullptr)) {
+      ok = 0;
+      break;
+    }
+    if (i >= dlen) {
+      i -= dlen;
+      OPENSSL_memcpy(dst + i, digest, dlen);
+      if (i == 0) {
+        break;
+      }
+    } else {
+      OPENSSL_memcpy(dst, digest + dlen - i, i);
+      break;
+    }
+  }
+  OPENSSL_free(buf);
+  if (!ok) {
+    return 0;
+  }
+  unsigned r = out_bits & 7;
+  if (r) {
+    dst[0] &= static_cast<uint8_t>((1u << r) - 1);
+  }
+  return 1;
+}
+
+}  // namespace
+
+extern "C" {
+
+int KCDSA_generate_parameters(KCDSA_KEY *key, int p_bits, int q_bits,
+                              uint8_t *seed_out, size_t *seed_len,
+                              uint32_t *count_out, uint8_t *j_out,
+                              size_t *j_len, uint8_t *h_out, size_t *h_len) {
+  if (key == nullptr || p_bits < 2048 || p_bits > 3072 || (p_bits % 256) != 0 ||
+      (q_bits != 224 && q_bits != 256)) {
+    return 0;
+  }
+  const EVP_MD *md = kcdsa_md_for_len(q_bits / 8);
+  if (md == nullptr) {
+    return 0;
+  }
+
+  int ret = 0;
+  BN_CTX *ctx = BN_CTX_new();
+  BIGNUM *J = BN_new();
+  BIGNUM *Q = BN_new();
+  BIGNUM *P = BN_new();
+  BIGNUM *two_j = BN_new();
+  BIGNUM *h = BN_new();
+  BIGNUM *G = BN_new();
+  const size_t seed_bytes = q_bits / 8;
+  const size_t u_bytes = (p_bits - q_bits) / 8;  // OS2BN 이 읽는 J 후보 길이
+  uint8_t *seed = reinterpret_cast<uint8_t *>(OPENSSL_malloc(seed_bytes + 4));
+  uint8_t *ubuf = reinterpret_cast<uint8_t *>(OPENSSL_malloc(u_bytes));
+  uint8_t *qbuf = reinterpret_cast<uint8_t *>(OPENSSL_malloc(seed_bytes));
+  if (ctx == nullptr || J == nullptr || Q == nullptr || P == nullptr ||
+      two_j == nullptr || h == nullptr || G == nullptr || seed == nullptr ||
+      ubuf == nullptr || qbuf == nullptr) {
+    goto err;
+  }
+
+  for (;;) {  // 소수 쌍 (J, Q, P) 탐색 — 실패 시 새 Seed
+    // Step 1. Seed = |Q|/8 랜덤 바이트
+    if (!RAND_bytes(seed, seed_bytes)) {
+      goto err;
+    }
+    // Step 2. U = PPGF(Seed, |P|-|Q|-4)
+    if (!kcdsa_ppgf(md, seed, seed_bytes, ubuf, p_bits - q_bits - 4) ||
+        BN_bin2bn(ubuf, u_bytes, J) == nullptr) {
+      goto err;
+    }
+    // Step 3. J = 2^{|P|-|Q|-1} | U | 1
+    if (!BN_set_bit(J, p_bits - q_bits - 1) || !BN_set_bit(J, 0)) {
+      goto err;
+    }
+    // Step 4. J 가 소수가 아니면 Seed 재생성
+    int j_prime = 0;
+    if (!BN_primality_test(&j_prime, J, BN_prime_checks_for_generation, ctx, 1,
+                           nullptr)) {
+      goto err;
+    }
+    if (!j_prime) {
+      continue;
+    }
+
+    // Step 5~12. Count 를 증가시키며 Q, P 탐색
+    uint32_t count;
+    int found = 0;
+    for (count = 1; count < (1u << 24); count++) {
+      // Seed || Count(4바이트 빅엔디안, 최상위 바이트 0)
+      seed[seed_bytes + 0] = 0;
+      seed[seed_bytes + 1] = static_cast<uint8_t>((count >> 16) & 0xff);
+      seed[seed_bytes + 2] = static_cast<uint8_t>((count >> 8) & 0xff);
+      seed[seed_bytes + 3] = static_cast<uint8_t>(count & 0xff);
+      // Step 8. U = PPGF(Seed||Count, |Q|)
+      if (!kcdsa_ppgf(md, seed, seed_bytes + 4, qbuf, q_bits) ||
+          BN_bin2bn(qbuf, seed_bytes, Q) == nullptr) {
+        goto err;
+      }
+      // Step 9. Q = 2^{|Q|-1} | U | 1
+      if (!BN_set_bit(Q, q_bits - 1) || !BN_set_bit(Q, 0)) {
+        goto err;
+      }
+      // Step 10. P = 2·J·Q + 1 (J·Q 의 비트 |P|-1 이 1이면 길이 초과 → 다음 Count)
+      if (!BN_mul(P, J, Q, ctx)) {
+        goto err;
+      }
+      if (BN_is_bit_set(P, p_bits - 1)) {
+        continue;
+      }
+      if (!BN_lshift1(P, P) || !BN_set_bit(P, 0)) {
+        goto err;
+      }
+      // Step 11. Q 가 소수가 아니면 다음 Count
+      int q_prime = 0;
+      if (!BN_primality_test(&q_prime, Q, BN_prime_checks_for_generation, ctx,
+                             1, nullptr)) {
+        goto err;
+      }
+      if (!q_prime) {
+        continue;
+      }
+      // Step 12. P 가 소수면 채택
+      int p_prime = 0;
+      if (!BN_primality_test(&p_prime, P, BN_prime_checks_for_generation, ctx,
+                             1, nullptr)) {
+        goto err;
+      }
+      if (p_prime) {
+        found = 1;
+        break;
+      }
+    }
+    if (!found) {
+      continue;  // Count 소진 → 새 Seed
+    }
+    *count_out = count;
+    break;
+  }
+
+  // 생성원 g 생성: 2J 를 지수로 G = h^{2J} mod P, G != 1 보장
+  if (!BN_lshift1(two_j, J)) {
+    goto err;
+  }
+  for (;;) {
+    if (!BN_rand(h, p_bits, BN_RAND_TOP_ANY, BN_RAND_BOTTOM_ANY) ||
+        !BN_mod_exp(G, h, two_j, P, ctx)) {
+      goto err;
+    }
+    if (!BN_is_one(G)) {
+      break;
+    }
+  }
+
+  // key 에 도메인 파라미터 설정
+  BN_free(key->p);
+  BN_free(key->q);
+  BN_free(key->g);
+  key->p = BN_dup(P);
+  key->q = BN_dup(Q);
+  key->g = BN_dup(G);
+  if (key->p == nullptr || key->q == nullptr || key->g == nullptr) {
+    goto err;
+  }
+
+  // 증거값 출력
+  OPENSSL_memcpy(seed_out, seed, seed_bytes);
+  *seed_len = seed_bytes;
+  *j_len = BN_bn2bin(J, j_out);
+  *h_len = BN_bn2bin(h, h_out);
+  ret = 1;
+
+err:
+  BN_free(J);
+  BN_free(Q);
+  BN_free(P);
+  BN_free(two_j);
+  BN_free(h);
+  BN_free(G);
+  OPENSSL_free(seed);
+  OPENSSL_free(ubuf);
+  OPENSSL_free(qbuf);
   BN_CTX_free(ctx);
   return ret;
 }

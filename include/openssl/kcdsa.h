@@ -65,6 +65,17 @@ OPENSSL_EXPORT int KCDSA_KEY_get_public(const KCDSA_KEY *key, uint8_t *out,
 // KCDSA_sig_len 은 서명 길이(2*|Q|바이트)를 반환한다. 파라미터 미설정 시 0.
 OPENSSL_EXPORT size_t KCDSA_sig_len(const KCDSA_KEY *key);
 
+// KCDSA_KEY_get_params 는 도메인 파라미터 P, Q, G 를 빅엔디안으로 각 버퍼에
+// 기록하고 길이를 반환한다. 성공 시 1.
+OPENSSL_EXPORT int KCDSA_KEY_get_params(const KCDSA_KEY *key, uint8_t *p,
+                                        size_t p_max, size_t *p_len, uint8_t *q,
+                                        size_t q_max, size_t *q_len, uint8_t *g,
+                                        size_t g_max, size_t *g_len);
+
+// KCDSA_KEY_get_private 는 개인키 x 를 빅엔디안으로 기록하고 길이를 반환한다.
+OPENSSL_EXPORT int KCDSA_KEY_get_private(const KCDSA_KEY *key, uint8_t *out,
+                                         size_t max_out, size_t *out_len);
+
 // KCDSA_sign 은 |msg| 에 서명한다. |md| 다이제스트 길이는 |Q| 바이트 길이와
 // 일치해야 한다. |k| 가 NULL이 아니면 그 난수값(빅엔디안)을 서명 난수로
 // 사용하고(KAT 용), NULL이면 내부적으로 난수를 생성한다. 서명은 |sig|(R||S,
@@ -78,6 +89,20 @@ OPENSSL_EXPORT int KCDSA_sign(const KCDSA_KEY *key, const EVP_MD *md,
 OPENSSL_EXPORT int KCDSA_verify(const KCDSA_KEY *key, const EVP_MD *md,
                                 const uint8_t *msg, size_t msg_len,
                                 const uint8_t *sig, size_t sig_len);
+
+// KCDSA_generate_parameters 는 비트 길이 |P|=p_bits, |Q|=q_bits 의 도메인
+// 파라미터 (P, Q, G) 를 TTAK.KO-12.0001 절차로 생성하여 |key| 에 설정한다.
+// 생성 증거값도 함께 반환한다(시험벡터 .rsp 출력용):
+//   - seed_out/seed_len: 증거 Seed (q_bits/8 바이트)
+//   - count_out: 소수 P,Q 를 찾은 Count 값
+//   - j_out/j_len: 보조 소수 J (P = 2·J·Q + 1)
+//   - h_out/h_len: 생성원 밑 h (G = h^{2J} mod P)
+// 각 out 버퍼는 충분히 커야 한다(seed: q_bits/8, j: p_bits/8, h: p_bits/8).
+// p_bits 는 2048..3072(256 배수), q_bits 는 224/256 만 허용. 성공 시 1.
+OPENSSL_EXPORT int KCDSA_generate_parameters(
+    KCDSA_KEY *key, int p_bits, int q_bits, uint8_t *seed_out, size_t *seed_len,
+    uint32_t *count_out, uint8_t *j_out, size_t *j_len, uint8_t *h_out,
+    size_t *h_len);
 
 
 #if defined(__cplusplus)
