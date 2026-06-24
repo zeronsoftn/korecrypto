@@ -223,6 +223,22 @@ set(
   gen/bcm/x86_64-mont5-linux.S
   third_party/fiat/asm/fiat_p256_adx_mul.S
   third_party/fiat/asm/fiat_p256_adx_sqr.S
+  gen/bcm/aes-gcm-avx2-x86_64-mingw64.S
+  gen/bcm/aes-gcm-avx512-x86_64-mingw64.S
+  gen/bcm/aesni-gcm-x86_64-mingw64.S
+  gen/bcm/aesni-x86_64-mingw64.S
+  gen/bcm/ghash-ssse3-x86_64-mingw64.S
+  gen/bcm/ghash-x86_64-mingw64.S
+  gen/bcm/p256-x86_64-asm-mingw64.S
+  gen/bcm/p256_beeu-x86_64-asm-mingw64.S
+  gen/bcm/rdrand-x86_64-mingw64.S
+  gen/bcm/sha1-x86_64-mingw64.S
+  gen/bcm/sha256-x86_64-mingw64.S
+  gen/bcm/sha512-x86_64-mingw64.S
+  gen/bcm/vpaes-x86_64-mingw64.S
+  gen/bcm/x86_64-mont-mingw64.S
+  gen/bcm/x86_64-mont5-mingw64.S
+  gen/bcm/rsaz-avx2-mingw64.S
 )
 
 set(
@@ -470,6 +486,7 @@ set(
   crypto/rand/ios.cc
   crypto/rand/rand.cc
   crypto/rand/trusty.cc
+  crypto/rand/uefi.cc
   crypto/rand/urandom.cc
   crypto/rand/windows.cc
   crypto/rc4/rc4.cc
@@ -780,6 +797,10 @@ set(
   gen/crypto/md5-x86_64-linux.S
   third_party/fiat/asm/fiat_curve25519_adx_mul.S
   third_party/fiat/asm/fiat_curve25519_adx_square.S
+  gen/crypto/aes128gcmsiv-x86_64-mingw64.S
+  gen/crypto/chacha-x86_64-mingw64.S
+  gen/crypto/chacha20_poly1305_x86_64-mingw64.S
+  gen/crypto/md5-x86_64-mingw64.S
 )
 
 set(

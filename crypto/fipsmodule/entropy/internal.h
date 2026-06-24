@@ -17,7 +17,8 @@
 
 #include <openssl/base.h>
 
-#if defined(OPENSSL_LINUX) || defined(OPENSSL_MACOS)
+#if defined(OPENSSL_LINUX) || defined(OPENSSL_MACOS) || \
+    defined(OPENSSL_WINDOWS) || defined(KORECRYPTO_BAREMETAL)
 
 BSSL_NAMESPACE_BEGIN
 namespace entropy {

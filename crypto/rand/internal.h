@@ -29,6 +29,16 @@
 #elif defined(OPENSSL_APPLE) && !defined(OPENSSL_MACOS)
 // Unlike macOS, iOS and similar hide away getentropy().
 #define OPENSSL_RAND_IOS
+#elif defined(OPENSSL_UEFI)
+// UEFI(freestanding): entropy comes from UEFI Boot Services (EFI_RNG_PROTOCOL),
+// provided via CRYPTO_uefi_init(gBS). See crypto/rand/uefi.cc.
+#define OPENSSL_RAND_UEFI
+#elif defined(KORECRYPTO_BAREMETAL)
+// 범용 bare-metal(freestanding): BoringSSL 은 OS RNG 를 모르므로, 통합자가
+// CRYPTO_sysrand / CRYPTO_init_sysrand 를 직접 제공해 링크해야 한다(이 빌드에는
+// 어떤 sysrand 구현도 포함되지 않는다). UEFI 처럼 환경 전용 엔트로피 소스를 둘
+// 경우엔 그 환경 매크로(예: OPENSSL_UEFI)가 위 분기에서 먼저 선택된다.
+#define KORECRYPTO_RAND_BAREMETAL
 #else
 // By default if you are integrating BoringSSL we expect you to
 // provide getentropy from the <unistd.h> header file.
@@ -52,9 +62,10 @@
 #define OPENSSL_FORK_DETECTION_PTHREAD_ATFORK
 
 #elif defined(OPENSSL_WINDOWS) || defined(OPENSSL_TRUSTY) || \
-    defined(__ZEPHYR__) || defined(CROS_EC)
+    defined(__ZEPHYR__) || defined(CROS_EC) || defined(KORECRYPTO_BAREMETAL)
 
-// These platforms do not fork.
+// These platforms do not fork. (bare-metal 타깃은 KORECRYPTO_BAREMETAL 로 포괄하며
+// UEFI 도 여기에 포함된다.)
 #define OPENSSL_DOES_NOT_FORK
 
 #else

@@ -5564,10 +5564,10 @@ extern "C" {
 
 // SEED (KS X 1213-1 / RFC 4269) and HIGHT (KS X 1213-2), KCMVP validation-
 // target block ciphers. Private NID range.
-#define SN_seed_ecb "SEED-ECB"
-#define NID_seed_ecb 2101
-#define SN_seed_cbc "SEED-CBC"
-#define NID_seed_cbc 2102
+// #define SN_seed_ecb "SEED-ECB"
+// #define NID_seed_ecb 2101
+// #define SN_seed_cbc "SEED-CBC"
+// #define NID_seed_cbc 2102
 #define SN_seed_ctr "SEED-CTR"
 #define NID_seed_ctr 2103
 #define SN_seed_gcm "SEED-GCM"

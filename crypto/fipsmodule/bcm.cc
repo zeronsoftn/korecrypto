@@ -20,8 +20,20 @@
 
 #include <stdlib.h>
 #if defined(BORINGSSL_FIPS)
+#if !defined(OPENSSL_WINDOWS) && !defined(KORECRYPTO_BAREMETAL)
+// sys/mman.h / unistd.h 는 POSIX 전용이다. 윈도우(COFF)/bare-metal(freestanding,
+// 예: UEFI)에서는 mprotect 경로가 Android/AArch64 에서만 쓰이므로 헤더를 포함하지
+// 않고, 아래에서 PROT_* 매크로만 정의해 무결성 검사 호출부가 컴파일되도록 한다.
 #include <sys/mman.h>
 #include <unistd.h>
+#else
+#ifndef PROT_READ
+#define PROT_READ 0x1
+#endif
+#ifndef PROT_EXEC
+#define PROT_EXEC 0x4
+#endif
+#endif
 #endif
 
 #include <openssl/digest.h>
@@ -145,6 +157,11 @@ using namespace bssl;
 // These symbols are filled in by delocate.go (in static builds) or a linker
 // script (in shared builds). They point to the start and end of the module, and
 // the location of the integrity hash, respectively.
+//
+// extern "C" 로 선언해 모든 ABI 에서 맹글링 없는 이름을 갖게 한다. 특히 MSVC ABI
+// (x86_64-unknown-uefi)는 전역 C++ 변수도 맹글링하므로(?...@@3QBEB) extern "C" 가
+// 없으면 delocate 가 합성하는 바닐라 심볼(BORINGSSL_bcm_text_*)과 어긋난다.
+extern "C" {
 extern const uint8_t BORINGSSL_bcm_text_start[];
 extern const uint8_t BORINGSSL_bcm_text_end[];
 extern const uint8_t BORINGSSL_bcm_text_hash[SHA256_DIGEST_LENGTH];
@@ -152,6 +169,7 @@ extern const uint8_t BORINGSSL_bcm_text_hash[SHA256_DIGEST_LENGTH];
 extern const uint8_t BORINGSSL_bcm_rodata_start[];
 extern const uint8_t BORINGSSL_bcm_rodata_end[];
 #endif
+}
 
 // assert_within is used to sanity check that certain symbols are within the
 // bounds of the integrity check. It checks that start <= symbol < end and

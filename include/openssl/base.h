@@ -22,6 +22,9 @@
 
 #include <stddef.h>  // IWYU pragma: export
 #include <stdint.h>  // IWYU pragma: export
+// bare-metal(freestanding) 빌드에서는 hosted 헤더(stdlib/sys/types)를 외부
+// freestanding libc(예: picolibc)가 공급한다(빌드의 BAREMETAL_LIBC_INCLUDE 참고).
+// 따라서 다른 타깃과 동일하게 그대로 포함한다.
 #include <stdlib.h>
 #include <sys/types.h>
 

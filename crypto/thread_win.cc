@@ -104,8 +104,19 @@ static void NTAPI thread_local_destructor(PVOID module, DWORD reason,
 // optimization from discarding the variable.
 //
 // Note, in the prefixed build, `p_thread_callback_boringssl` may be a macro.
+// .CRT$XLA to .CRT$XLZ is an array of PIMAGE_TLS_CALLBACK pointers that are
+// called automatically by the OS loader code (not the CRT) when the module is
+// loaded and on thread creation. They are NOT called if the module has been
+// loaded by a LoadLibrary() call. It must have implicitly been loaded at
+// process startup.
+//
+// See VC\crt\src\tlssup.c for reference.
 #define STRINGIFY(x) #x
 #define EXPAND_AND_STRINGIFY(x) STRINGIFY(x)
+
+#if defined(_MSC_VER)
+
+// MSVC: use linker /INCLUDE pragmas and segment pragmas to place the callback.
 #ifdef _WIN64
 __pragma(comment(linker, "/INCLUDE:_tls_used")) __pragma(comment(
     linker, "/INCLUDE:" EXPAND_AND_STRINGIFY(p_thread_callback_boringssl)))
@@ -114,22 +125,6 @@ __pragma(comment(linker, "/INCLUDE:__tls_used")) __pragma(comment(
     linker, "/INCLUDE:_" EXPAND_AND_STRINGIFY(p_thread_callback_boringssl)))
 #endif
 
-// .CRT$XLA to .CRT$XLZ is an array of PIMAGE_TLS_CALLBACK pointers that are
-// called automatically by the OS loader code (not the CRT) when the module is
-// loaded and on thread creation. They are NOT called if the module has been
-// loaded by a LoadLibrary() call. It must have implicitly been loaded at
-// process startup.
-//
-// By implicitly loaded, I mean that it is directly referenced by the main EXE
-// or by one of its dependent DLLs. Delay-loaded DLL doesn't count as being
-// implicitly loaded.
-//
-// See VC\crt\src\tlssup.c for reference.
-
-// The linker must not discard p_thread_callback_boringssl. (We force a
-// reference to this variable with a linker /INCLUDE:symbol pragma to ensure
-// that.) If this variable is discarded, the OnThreadExit function will never
-// be called.
 #ifdef _WIN64
 
 // .CRT section is merged with .rdata on x64 so it must be constant data.
@@ -158,6 +153,24 @@ PIMAGE_TLS_CALLBACK p_thread_callback_boringssl = thread_local_destructor;
 #pragma data_seg()
 
 #endif  // _WIN64
+
+#else  // !_MSC_VER
+
+// MinGW/clang(GNU 툴체인)에는 const_seg/comment(linker) 프라그마가 없다. 대신
+// section/used 속성으로 콜백 포인터를 .CRT$XLC 에 배치한다. mingw-w64 CRT 가
+// .CRT$XLA..XLZ 사이의 콜백들을 TLS 디렉터리에 연결해 OS 로더가 호출한다.
+// _tls_used 를 참조해 TLS 디렉터리가 반드시 생성되도록 강제한다.
+extern "C" {
+extern char _tls_used;
+}
+static void *const force_tls_used __attribute__((used)) = &_tls_used;
+
+extern "C" {
+__attribute__((section(".CRT$XLC"), used)) PIMAGE_TLS_CALLBACK
+    p_thread_callback_boringssl = thread_local_destructor;
+}
+
+#endif  // _MSC_VER
 
 static void **get_thread_locals() {
   // `TlsGetValue` clears the last error even on success, so that callers may
