@@ -251,8 +251,8 @@ if(KORECRYPTO_UEFI)
   set(KORECRYPTO_BAREMETAL ON)
   add_definitions(-DKORECRYPTO_UEFI -D__UEFI__)
   add_compile_options(
-      "$<$<COMPILE_LANGUAGE:C,CXX>:-U_WIN32>"
-      -nostdlib)
+    "$<$<COMPILE_LANGUAGE:C,CXX>:-U_WIN32;-ffreestanding>"
+  )
 
   # UEFI 환경 전용. BORINGSSL_CAN_DIVIDE_UINT128 을 비활성화 하기 위함
   # rustc 에서의 x86_64-unknown-uefi target 이 clang 의 x86_64-unknown-uefi 와 abi 가 다른 문제가 있다.
@@ -294,6 +294,9 @@ if(KORECRYPTO_BAREMETAL)
   # 매크로를 자동 유도하지만, target.h 가 #ifndef 가드를 두므로 중복 정의 경고
   # 없이 안전하다.
   add_definitions(-DKORECRYPTO_BAREMETAL)
+
+  set(CMAKE_C_LINK_FLAGS "${CMAKE_C_LINK_FLAGS} -nostdlib")
+  set(CMAKE_CXX_LINK_FLAGS "${CMAKE_CXX_LINK_FLAGS} -nostdlib++")
 endif()
 
 # USE_CUSTOM_LIBCXX: BoringSSL 의 C++ 코드는 STL(vector/memory/optional/...)을 쓴다.
@@ -365,6 +368,10 @@ if(USE_CUSTOM_LIBCXX)
     "${LIBCXX_CONFIG_DIR}"
     "${LIBCXX_DIR}/include"
     "${LIBCXXABI_DIR}/include")
+
+  if(KORECRYPTO_BAREMETAL)
+    add_definitions(-D_LIBPCPP_DEFINE_NEW_HANDLER=1)
+  endif()
 
   if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     # UEFI 는 LLP64(long=32)라 clang 이 __LP64__ 를 정의하지 않는다. 그러나 libc++abi 의
@@ -464,7 +471,6 @@ if(USE_CUSTOM_LIBCXX)
   # language-specific compile-only flags.
   add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-nostdinc++>")
 
-  set(CMAKE_CXX_LINK_FLAGS "${CMAKE_CXX_LINK_FLAGS} -nostdlib++")
   include_directories(
     SYSTEM
     "${LIBCXX_CONFIG_DIR}"
