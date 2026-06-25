@@ -179,8 +179,34 @@ func (d *delocation) loadAarch64Address(statement *node32, targetReg string, sym
 
 	d.writeCommentedNode(statement)
 
+	// clang COFF 의 .refptr.X 는 X 의 주소를 담는 모듈 밖 포인터(.rdata$.refptr)다.
+	// X 가 모듈 내부 심볼이면 포인터를 거치지 않고 X 의 로컬타깃 주소를 직접 계산해
+	// (adrp+add) 해시 영역에 링크 의존 재배치(.rdata$.refptr 참조)가 남지 않게 한다.
+	// 이어지는 ldr(포인터 역참조)은 ARMBaseIndexScale 의 .refptr 처리에서 버린다.
+	// (x86_64 COFF 의 `movq .refptr.X → leaq .LX_local_target` 과 동일한 취지.)
+	if strings.HasPrefix(symbol, ".refptr.") {
+		target := strings.TrimPrefix(symbol, ".refptr.")
+		if _, ok := d.symbols[target]; ok {
+			// 모듈 내부 심볼: 포인터를 거치지 않고 &target 을 직접 계산한다.
+			sym := localTargetName(target)
+			fmt.Fprintf(d.output, "\tadrp %s, %s%s\n", targetReg, sym, offsetStr)
+			fmt.Fprintf(d.output, "\tadd %s, %s, :lo12:%s%s\n", targetReg, targetReg, sym, offsetStr)
+		} else {
+			// 외부 심볼: 모듈 내부(꼬리) 포인터 테이블 bcm_external_target(.quad target)
+			// 에서 &target 을 적재한다. 해시 영역엔 모듈 내부 포인터 참조만 남는다.
+			ptr := d.coffExternalPtrName(target)
+			fmt.Fprintf(d.output, "\tadrp %s, %s\n", targetReg, ptr)
+			fmt.Fprintf(d.output, "\tldr %s, [%s, :lo12:%s]\n", targetReg, targetReg, ptr)
+		}
+		// 두 경우 모두 &target 을 targetReg 에 적재했다. 원본의 역참조 ldr 은
+		// ARMBaseIndexScale 의 .refptr 처리에서 버린다.
+		return statement, nil
+	}
+
 	_, isKnown := d.symbols[symbol]
-	isLocal := strings.HasPrefix(symbol, ".L")
+	// AArch64 COFF 의 바레 'L' 로컬 라벨(예: 로컬 데이터 LK256)도 ".L" 과 동일하게
+	// 파일별 로컬로 취급한다(GOT 보조함수 경로로 가면 안 된다).
+	isLocal := strings.HasPrefix(symbol, ".L") || d.isAarch64LocalLabel(symbol)
 	if isKnown || isLocal || isSynthesized(symbol) {
 		if isLocal {
 			symbol = d.mapLocalSymbol(symbol)
@@ -200,6 +226,17 @@ func (d *delocation) loadAarch64Address(statement *node32, targetReg string, sym
 
 	if offsetStr != "" {
 		panic("non-zero offset for helper-based reference")
+	}
+
+	// COFF 에는 GOT 가 없다. 외부 심볼 주소(&sym)는 모듈 밖 포인터 테이블
+	// (bcm_external_sym: .quad sym)에서 직접 적재한다. adrp+ldr 가 그 포인터를
+	// 가리키도록 하면 targetReg = &sym 이 된다(ELF 의 GOT 보조함수와 동일 결과).
+	// 후속 `ldr ..., [reg, :got_lo12:sym]` 은 ARMGOTLow12 처리에서 그대로 드롭된다.
+	if d.format == objectFormatCOFF {
+		ptr := d.coffExternalPtrName(symbol)
+		fmt.Fprintf(d.output, "\tadrp %s, %s\n", targetReg, ptr)
+		fmt.Fprintf(d.output, "\tldr %s, [%s, :lo12:%s]\n", targetReg, targetReg, ptr)
+		return statement, nil
 	}
 
 	// GOT helpers also dereference the GOT entry, thus the subsequent ldr
@@ -320,7 +357,12 @@ func (d *delocation) processAarch64Instruction(statement, instruction *node32) (
 				symbol, offset, _, didChange, symbolIsLocal, _ := d.parseMemRef(arg.up)
 				changed = didChange
 
-				if _, knownSymbol := d.symbols[symbol]; knownSymbol {
+				if d.isAarch64LocalLabel(symbol) {
+					// AArch64 COFF 의 바레 'L' 로컬 라벨(예: 분기 대상 Loop)은 파일별
+					// 로컬로 매핑한다. 전역 심볼/redirector 가 아니다.
+					symbol = d.mapLocalSymbol(symbol) + offset
+					changed = true
+				} else if _, knownSymbol := d.symbols[symbol]; knownSymbol {
 					symbol = localTargetName(symbol)
 					changed = true
 				} else if !symbolIsLocal && !isSynthesized(symbol) {
@@ -378,6 +420,18 @@ func (d *delocation) processAarch64Instruction(statement, instruction *node32) (
 						case "ldr", "ldrh", "ldrb", "ldrsw", "ldrsh", "ldrsb":
 						default:
 							panic("Symbol reference outside of load instruction")
+						}
+
+						// .refptr.X 의 경우, loadAarch64Address 가 이미 &X 를 targetReg 에
+						// 적재했으므로(모듈=adrp+add, 외부=adrp+ldr) 원본의 포인터 역참조
+						// ldr 은 통째로 버린다(필요하면 목적 레지스터로 mov).
+						// GOT(:got_lo12:) 처리와 동일.
+						if strings.Contains(d.contents(parts), ".refptr.") {
+							d.writeCommentedNode(statement)
+							if baseAddrReg != args[0] {
+								d.output.WriteString("\tmov " + args[0] + ", " + baseAddrReg + "\n")
+							}
+							return statement, nil
 						}
 
 						// Suppress the offset; adrp loaded the full address. This assumes the

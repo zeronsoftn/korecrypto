@@ -357,15 +357,22 @@ Args:
 				if offset != "" || !d.isRIPRelative(memRef) {
 					return nil, fmt.Errorf(".refptr reference in unexpected form: %q", strings.TrimSpace(d.contents(statement)))
 				}
-				if _, known := d.symbols[target]; !known {
-					return nil, fmt.Errorf(".refptr to non-module symbol %q", target)
-				}
 				if instructionName != "movq" {
 					return nil, fmt.Errorf(".refptr used outside movq (got %q)", instructionName)
 				}
-				// movq .refptr.X(%rip), reg  ==>  leaq .LX_local_target(%rip), reg
-				instructionName = "leaq"
-				symbol = localTargetName(target)
+				// .refptr.X 는 X 의 주소(.quad X)를 담는 clang 합성 포인터다.
+				// movq .refptr.X(%rip), reg 는 reg 에 &X 를 적재한다.
+				if _, known := d.symbols[target]; known {
+					// 모듈 내부 심볼이면 직접 그 주소를 적재한다:
+					//   movq .refptr.X(%rip), reg  ==>  leaq .LX_local_target(%rip), reg
+					instructionName = "leaq"
+					symbol = localTargetName(target)
+				} else {
+					// 외부 심볼(예: stderr)이면 모듈 밖 포인터 테이블에서 그 주소를
+					// 읽어온다(leaq <external>(%rip) 와 동일한 메커니즘). 결과 reg = &X:
+					//   movq .refptr.X(%rip), reg  ==>  movq bcm_external_X(%rip), reg
+					symbol = d.coffExternalPtrName(target)
+				}
 				changed = true
 			} else if symbolIsLocal {
 				// parseMemRef 가 이미 매핑함.
@@ -428,6 +435,11 @@ Args:
 // 모두 단일 .text 안(꼬리는 끝 마커 뒤)에 배치한다.
 func (d *delocation) emitModuleCOFF(w stringWriter, inputs []inputFile, maxObservedFileNumber int, fileDirectivesContainMD5 bool) error {
 	w.WriteString(".text\n")
+	if d.processor == aarch64 {
+		// aarch64 는 adrp 가 항상 재배치를 내므로(페이지 오프셋이 링크 의존), 모듈을
+		// 페이지 경계로 정렬해 그 오프셋을 링크 독립 상수로 고정한다. ELF 경로와 동일.
+		w.WriteString(".p2align 12\n")
+	}
 	w.WriteString("BORINGSSL_bcm_text_start:\n")
 	w.WriteString(localTargetName("BORINGSSL_bcm_text_start") + ":\n")
 
@@ -441,31 +453,54 @@ func (d *delocation) emitModuleCOFF(w stringWriter, inputs []inputFile, maxObser
 	w.WriteString("BORINGSSL_bcm_text_end:\n")
 	w.WriteString(localTargetName("BORINGSSL_bcm_text_end") + ":\n")
 
-	// 외부 호출 redirector 썽크. 각자 단일 jmp 명령이다. __imp_ 로 시작하는
-	// dllimport 심볼은 IAT 항목을 통한 간접 점프를 사용한다.
+	// 외부 호출 redirector 썽크. COFF 에서는 ELF 메타데이터(.hidden/.type/.size/
+	// .cfi_*)를 쓰지 않고 단순 레이블 + 본문만 낸다(x86_64 COFF 와 동일 방식).
+	// x86_64 는 단일 jmp(__imp_ 는 IAT 간접 점프), aarch64 는 단일 b 분기다.
 	for _, symbol := range sortedSet2(d.redirectors) {
 		redirector := d.redirectors[symbol]
-		w.WriteString(redirector + ":\n")
-		if strings.HasPrefix(symbol, "__imp_") {
-			w.WriteString("\tjmp *" + symbol + "(%rip)\n")
-		} else {
-			w.WriteString("\tjmp " + symbol + "\n")
+		switch d.processor {
+		case aarch64:
+			w.WriteString(".p2align 2\n")
+			w.WriteString(redirector + ":\n")
+			w.WriteString("\thint #34 // bti c\n")
+			w.WriteString("\tb " + symbol + "\n")
+		default:
+			w.WriteString(redirector + ":\n")
+			if strings.HasPrefix(symbol, "__imp_") {
+				w.WriteString("\tjmp *" + symbol + "(%rip)\n")
+			} else {
+				w.WriteString("\tjmp " + symbol + "\n")
+			}
 		}
 	}
 
-	// BSS 접근자. 각자 단일 LEA 후 RET 이다.
+	// BSS 접근자. x86_64 는 LEA 후 RET, aarch64 는 adrp/add 후 RET 이다.
 	for _, name := range sortedSet2(d.bssAccessorsNeeded) {
 		funcName := accessorName(name)
 		target := d.bssAccessorsNeeded[name]
-		w.WriteString(funcName + ":\n")
-		w.WriteString("\tleaq\t" + target + "(%rip), %rax\n\tret\n")
+		switch d.processor {
+		case aarch64:
+			w.WriteString(".p2align 2\n")
+			w.WriteString(funcName + ":\n")
+			w.WriteString("\thint #34 // bti c\n")
+			w.WriteString("\tadrp x0, " + target + "\n")
+			w.WriteString("\tadd x0, x0, :lo12:" + target + "\n")
+			w.WriteString("\tret\n")
+		default:
+			w.WriteString(funcName + ":\n")
+			w.WriteString("\tleaq\t" + target + "(%rip), %rax\n\tret\n")
+		}
 	}
 
-	// 외부 주소 포인터 테이블. 레이블 이름은 참조부(coffExternalPtrName)와 동일하게
-	// decorateSymbol 로 만든다(MSVC 따옴표 심볼이면 따옴표 안쪽에 접두사 삽입).
-	for _, sym := range sortedSet(d.coffExternalPtrs) {
-		w.WriteString(decorateSymbol("bcm_external_", sym, "") + ":\n")
-		w.WriteString("\t.quad " + sym + "\n")
+	// 외부 주소 포인터 테이블(x86_64/aarch64 공통). COFF 에는 GOT 가 없으므로 외부
+	// 심볼 주소는 모듈 밖 .quad <sym> 포인터에서 적재한다(leaq/adrp+ldr 가 이 테이블을
+	// 가리키도록 변환됨). 레이블 이름은 참조부(coffExternalPtrName)와 동일하게
+	// decorateSymbol 로 만든다(MSVC 따옴표 심볼이면 따옴표 안쪽에 접두사).
+	{
+		for _, sym := range sortedSet(d.coffExternalPtrs) {
+			w.WriteString(decorateSymbol("bcm_external_", sym, "") + ":\n")
+			w.WriteString("\t.quad " + sym + "\n")
+		}
 	}
 
 	// 무결성 해시 자리표시자. inject_hash 가 실제 해시로 채운다.

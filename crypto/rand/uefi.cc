@@ -21,7 +21,7 @@
 #include "../bcm_support.h"
 #include "internal.h"
 
-#if defined(OPENSSL_RAND_UEFI)
+#if defined(OPENSSL_UEFI)
 
 #include <stdlib.h>  // abort (overlay)
 
@@ -82,6 +82,7 @@ extern "C" void CRYPTO_uefi_init(void *boot_services) {
   g_boot_services = reinterpret_cast<EFI_BOOT_SERVICES *>(boot_services);
 }
 
+#if defined(OPENSSL_RAND_UEFI)
 void bssl::CRYPTO_init_sysrand() {}
 
 void bssl::CRYPTO_sysrand(uint8_t *out, size_t requested) {
@@ -110,3 +111,5 @@ void bssl::CRYPTO_sysrand(uint8_t *out, size_t requested) {
 }
 
 #endif  // OPENSSL_RAND_UEFI
+
+#endif  // OPENSSL_UEFI

@@ -173,6 +173,12 @@ func (d *delocation) processInput(input inputFile) (err error) {
 					if len(fields) >= 2 {
 						original := fields[1]
 						renamed := d.mapCOFFSymbol(original)
+						// AArch64 COFF 의 바레 'L' 로컬 라벨은 라벨/참조와 동일하게
+						// 파일별로 개명해야 한다(그렇지 않으면 .def 가 정의되지 않은
+						// 원본 이름을 선언해 미정의 심볼이 된다).
+						if renamed == original && d.isAarch64LocalLabel(original) {
+							renamed = d.mapLocalSymbol(original)
+						}
 						if renamed != original {
 							// 개명된 이름으로 출력.
 							newLine := strings.Replace(line, ".def\t"+original, ".def\t"+renamed, 1)
@@ -204,18 +210,21 @@ func (d *delocation) processInput(input inputFile) (err error) {
 		case ruleLabel:
 			statement, err = d.processLabel(statement, node.up)
 		case ruleInstruction:
-			if d.format == objectFormatCOFF {
-				// COFF 는 현재 x86_64 만 지원한다.
-				statement, err = d.processCOFFInstruction(statement, node.up)
-			} else {
-				switch d.processor {
-				case x86_64:
+			switch d.processor {
+			case x86_64:
+				if d.format == objectFormatCOFF {
+					statement, err = d.processCOFFInstruction(statement, node.up)
+				} else {
 					statement, err = d.processIntelInstruction(statement, node.up)
-				case aarch64:
-					statement, err = d.processAarch64Instruction(statement, node.up)
-				default:
-					panic("unknown processor")
 				}
+			case aarch64:
+				// aarch64 의 명령어 처리(심볼→로컬타깃, 외부분기→redirector,
+				// adrp/:lo12: 로컬 주소적재, GOT 보조함수)는 오브젝트 형식과
+				// 무관하다. ELF/COFF 모두 동일한 처리기를 쓰고, 형식별 차이는
+				// 모듈 프레이밍(섹션 평탄화·마커·tail)에서만 다룬다.
+				statement, err = d.processAarch64Instruction(statement, node.up)
+			default:
+				panic("unknown processor")
 			}
 		default:
 			panic(fmt.Sprintf("unknown top-level statement type %q", rul3s[node.pegRule]))
@@ -228,7 +237,6 @@ func (d *delocation) processInput(input inputFile) (err error) {
 
 	return nil
 }
-
 
 func (d *delocation) processSymbolExpr(expr *node32, b *strings.Builder) bool {
 	changed := false
@@ -400,6 +408,12 @@ func (d *delocation) processLabel(statement, label *node32) (*node32, error) {
 		// different .s inputs don't collide.
 		d.output.WriteString(d.mapLocalSymbol(symbol) + ":\n")
 	case ruleSymbolName:
+		// AArch64 COFF 의 바레 'L' 로컬 라벨은 파일별 로컬 심볼로 매핑한다(.L 과 동일
+		// 취급). 전역 라벨이 아니므로 localTargetName/원본 라벨을 내지 않는다.
+		if d.isAarch64LocalLabel(symbol) {
+			d.output.WriteString(d.mapLocalSymbol(symbol) + ":\n")
+			return statement, nil
+		}
 		// COFF 형식에서는 중복 가능한 심볼(예: SEH 핸들러)을 파일별로 개명한다.
 		mapped := symbol
 		if d.format == objectFormatCOFF {
@@ -430,7 +444,6 @@ func instructionArgs(node *node32) (argNodes []*node32) {
 
 	return argNodes
 }
-
 
 func (d *delocation) gatherOffsets(symRef *node32, offsets string) (*node32, string) {
 	for symRef != nil && symRef.pegRule == ruleOffset {
@@ -578,7 +591,6 @@ func compare(w stringWriter, instr, a, b string) wrapperFunc {
 	}
 }
 
-
 func saveFlags(w stringWriter, redzoneCleared bool) wrapperFunc {
 	return func(k func()) {
 		if !redzoneCleared {
@@ -691,7 +703,6 @@ func (d *delocation) isRIPRelative(node *node32) bool {
 	return node != nil && node.pegRule == ruleBaseIndexScale && d.contents(node) == "(%rip)"
 }
 
-
 func (d *delocation) handleBSS(statement *node32) (*node32, error) {
 	lastStatement := statement
 	for statement = statement.next; statement != nil; lastStatement, statement = statement, statement.next {
@@ -748,8 +759,24 @@ func (d *delocation) handleBSS(statement *node32) (*node32, error) {
 	return lastStatement, nil
 }
 
-
 func transform(w stringWriter, inputs []inputFile) error {
+	// Detect the processor and object format up front; symbol gathering below
+	// needs them to recognise AArch64's bare 'L' local-label convention.
+	processor := x86_64
+	if len(inputs) > 0 {
+		processor = detectProcessor(inputs[0])
+	}
+	format := objectFormatELF
+	if len(inputs) > 0 {
+		format = detectFormat(inputs[0])
+	}
+	// isLocalLabelName reports whether a label/symbol is file-local and thus
+	// must not be treated as a (unique) module-global symbol.
+	isLocalLabelName := func(name string) bool {
+		return processor == aarch64 && format == objectFormatCOFF &&
+			len(name) >= 2 && name[0] == 'L'
+	}
+
 	// symbols contains all defined symbols.
 	symbols := make(map[string]struct{})
 	// fileNumbers is the set of IDs seen in .file directives.
@@ -765,6 +792,12 @@ func transform(w stringWriter, inputs []inputFile) error {
 	for _, input := range inputs {
 		forEachPath(input.ast.up, func(node *node32) {
 			symbol := input.contents[node.begin:node.end]
+			// AArch64 COFF bare 'L' labels are file-local; they are mapped
+			// per-file (like ".L") and must not be registered as module-global
+			// symbols (which would falsely collide across input files).
+			if isLocalLabelName(symbol) {
+				return
+			}
 			if _, ok := symbols[symbol]; ok {
 				panic(fmt.Sprintf("Duplicate symbol found: %q in %q", symbol, input.path))
 			}
@@ -818,16 +851,7 @@ func transform(w stringWriter, inputs []inputFile) error {
 			}
 		}, ruleStatement, ruleLocationDirective)
 	}
-
-	processor := x86_64
-	if len(inputs) > 0 {
-		processor = detectProcessor(inputs[0])
-	}
-
-	format := objectFormatELF
-	if len(inputs) > 0 {
-		format = detectFormat(inputs[0])
-	}
+	// processor and format were detected at the top of transform.
 
 	commentIndicator := "#"
 	if processor == aarch64 {
@@ -1116,6 +1140,18 @@ func decorateSymbol(prefix, name, suffix string) string {
 // symbol named name.
 func localTargetName(name string) string {
 	return decorateSymbol(".L", name, "_local_target")
+}
+
+// isAarch64LocalLabel reports whether name uses AArch64's bare 'L' private
+// (local) label prefix. clang's assembler treats 'L'-prefixed symbols as
+// file-local (temporary) on AArch64 COFF/Mach-O, unlike ELF's ".L". The
+// perlasm-generated *-armv8-win.S files use this convention (e.g. "Loop",
+// "LK256"), so when delocate flattens several of them into one unit these
+// per-file labels would otherwise collide. We map them per-file like ".L"
+// labels. (ELF AArch64 uses ".L", so this only applies to COFF.)
+func (d *delocation) isAarch64LocalLabel(name string) bool {
+	return d.processor == aarch64 && d.format == objectFormatCOFF &&
+		len(name) >= 2 && name[0] == 'L'
 }
 
 func isSynthesized(symbol string) bool {

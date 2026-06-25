@@ -238,16 +238,28 @@ endif()
 #   - KORECRYPTO_BAREMETAL: 범용 bare-metal 머신러리(외부 libc include, 예외/스레드
 #       OFF, 번들 libc++)를 켜는 플래그. UEFI triple 이면 자동 ON. 다른 bare-metal
 #       타깃(예: ELF freestanding)은 -DKORECRYPTO_BAREMETAL=ON 으로 명시한다.
-#   - BORINGSSL_UEFI: UEFI 환경 전용 글루(__EDK2_BORINGSSL__ 등). UEFI triple 일 때만 ON.
-set(BORINGSSL_UEFI OFF)
-if(CMAKE_C_COMPILER_TARGET MATCHES "uefi" OR CMAKE_ASM_COMPILER_TARGET MATCHES "uefi")
-  set(BORINGSSL_UEFI ON)
-endif()
+#   - KORECRYPTO_UEFI: UEFI 환경 전용 글루(__EDK2_BORINGSSL__ 등). UEFI triple 일 때만 ON.
+
 option(KORECRYPTO_BAREMETAL "Build for a generic bare-metal (freestanding) target" OFF)
-if(BORINGSSL_UEFI)
-  # UEFI 는 bare-metal 의 한 사례이므로 범용 머신러리도 함께 켠다.
-  set(KORECRYPTO_BAREMETAL ON)
+option(KORECRYPTO_UEFI "Build for a UEFI target" OFF)
+
+if(CMAKE_C_COMPILER_TARGET MATCHES "uefi" OR CMAKE_ASM_COMPILER_TARGET MATCHES "uefi")
+  set(KORECRYPTO_UEFI ON)
 endif()
+
+if(KORECRYPTO_UEFI)
+  set(KORECRYPTO_BAREMETAL ON)
+  add_definitions(-DKORECRYPTO_UEFI -D__UEFI__)
+  add_compile_options(
+      "$<$<COMPILE_LANGUAGE:C,CXX>:-U_WIN32>"
+      -nostdlib)
+
+  # UEFI 환경 전용. BORINGSSL_CAN_DIVIDE_UINT128 을 비활성화 하기 위함
+  # rustc 에서의 x86_64-unknown-uefi target 이 clang 의 x86_64-unknown-uefi 와 abi 가 다른 문제가 있다.
+  # https://github.com/rust-lang/rust/issues/158292
+  add_definitions(-D__EDK2_BORINGSSL__)
+endif()
+
 set(BAREMETAL_LIBC_INCLUDE "" CACHE PATH
     "Include dir of an external freestanding C library (e.g. picolibc) for bare-metal builds")
 if(KORECRYPTO_BAREMETAL)
@@ -256,6 +268,7 @@ if(KORECRYPTO_BAREMETAL)
       "bare-metal (freestanding) build requires a libc include dir. Set -DBAREMETAL_LIBC_INCLUDE=<dir>")
   endif()
   message(STATUS "bare-metal freestanding build: using libc include ${BAREMETAL_LIBC_INCLUDE}")
+
   # freestanding libc 헤더를 -isystem 으로 추가한다(헤더 경고 억제). clang 의 resource
   # 헤더(stddef/stdarg 등)는 시스템 검색 경로에 그대로 남고, picolibc 의 stdint.h
   # 는 include_next 로 그 resource stdint.h 를 가져오므로 libc 가 더 앞서야 한다.
@@ -281,13 +294,6 @@ if(KORECRYPTO_BAREMETAL)
   # 매크로를 자동 유도하지만, target.h 가 #ifndef 가드를 두므로 중복 정의 경고
   # 없이 안전하다.
   add_definitions(-DKORECRYPTO_BAREMETAL)
-endif()
-
-if(BORINGSSL_UEFI)
-  # UEFI 환경 전용. BORINGSSL_CAN_DIVIDE_UINT128 을 비활성화 하기 위함
-  # rustc 에서의 x86_64-unknown-uefi target 이 clang 의 x86_64-unknown-uefi 와 abi 가 다른 문제가 있다.
-  # https://github.com/rust-lang/rust/issues/158292
-  add_definitions(-D__EDK2_BORINGSSL__)
 endif()
 
 # USE_CUSTOM_LIBCXX: BoringSSL 의 C++ 코드는 STL(vector/memory/optional/...)을 쓴다.
@@ -353,18 +359,20 @@ if(USE_CUSTOM_LIBCXX)
 
   # libc++ 헤더가 picolibc(C 헤더)보다 먼저 검색되어야 한다. libc++ 의 <cstdlib> 는
   # 자신의 <stdlib.h> 래퍼를 먼저 찾은 뒤 include_next 로 picolibc 의 C <stdlib.h> 를
-  # 가져오기 때문이다. picolibc 는 BORINGSSL_UEFI 블록에서 먼저 등록되므로, 여기서
+  # 가져오기 때문이다. picolibc 는 KORECRYPTO_UEFI 블록에서 먼저 등록되므로, 여기서
   # BEFORE 로 prepend 해 libc++ 우선순위를 높인다.
   include_directories(BEFORE SYSTEM
     "${LIBCXX_CONFIG_DIR}"
     "${LIBCXX_DIR}/include"
     "${LIBCXXABI_DIR}/include")
 
-  # UEFI 는 LLP64(long=32)라 clang 이 __LP64__ 를 정의하지 않는다. 그러나 libc++abi 의
-  # __cxa_exception 레이아웃은 __LP64__ 로 64비트(포인터) 레이아웃을 선택하며, 이게
-  # 없으면 _Unwind_Exception(aligned 16) 과 어긋나 static_assert 가 깨진다. 64비트
-  # 포인터 환경이므로 LP64 레이아웃이 맞다 → 공통으로 정의한다.
-  add_definitions(-D__LP64__=1)
+  if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    # UEFI 는 LLP64(long=32)라 clang 이 __LP64__ 를 정의하지 않는다. 그러나 libc++abi 의
+    # __cxa_exception 레이아웃은 __LP64__ 로 64비트(포인터) 레이아웃을 선택하며, 이게
+    # 없으면 _Unwind_Exception(aligned 16) 과 어긋나 static_assert 가 깨진다. 64비트
+    # 포인터 환경이므로 LP64 레이아웃이 맞다 → 공통으로 정의한다.
+    add_definitions(-D__LP64__=1)
+  endif()
 endif()
 
 if(FIPS)
@@ -418,7 +426,7 @@ if(FIPS_DELOCATE OR NOT OPENSSL_NO_ASM)
     if (NOT OPENSSL_NO_ASM)
       set(OPENSSL_ASM TRUE)
     endif()
-    if(BORINGSSL_UEFI)
+    if(KORECRYPTO_UEFI)
       # UEFI 는 COFF/PE 형식(MS x64 ABI)이므로 mingw64 플레이버를 사용한다.
       # clang 은 x86_64-unknown-uefi 에서 _WIN32 를 정의하지 않으므로 직접 주입해
       # gen/bcm/*-mingw64.S 파일의 #if defined(_WIN32) 가드를 활성화한다.
@@ -454,7 +462,8 @@ if(USE_CUSTOM_LIBCXX)
   # CMAKE_CXX_FLAGS ends up in the linker flags as well, so use
   # add_compile_options. There does not appear to be a way to set
   # language-specific compile-only flags.
-  add_compile_options("-nostdinc++")
+  add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-nostdinc++>")
+
   set(CMAKE_CXX_LINK_FLAGS "${CMAKE_CXX_LINK_FLAGS} -nostdlib++")
   include_directories(
     SYSTEM
@@ -769,6 +778,16 @@ if(FIPS_DELOCATE)
     set(FIPS_COFF TRUE)
   endif()
 
+  # COFF/aarch64 판별. x86_64 COFF 는 모듈이 완전히 재배치-프리(rip-relative 를
+  # 어셈블러가 해소)지만, aarch64 는 adrp/:lo12: 가 링크 시 해소되는 "링크 독립"
+  # 재배치를 남긴다(ELF 와 동일). 따라서 aarch64 는 정적 오브젝트가 아니라 링크되어
+  # 재배치가 해소된 모듈을 해시해야 런타임 무결성 검사와 일치한다.
+  set(FIPS_COFF_AARCH64 FALSE)
+  if(FIPS_COFF AND (CMAKE_C_COMPILER_TARGET MATCHES "aarch64" OR
+                    CMAKE_ASM_COMPILER_TARGET MATCHES "aarch64"))
+    set(FIPS_COFF_AARCH64 TRUE)
+  endif()
+
   go_executable(delocate boringssl.googlesource.com/boringssl.git/util/fipstools/delocate)
   add_custom_command(
     OUTPUT bcm-delocated.S
@@ -790,14 +809,39 @@ if(FIPS_DELOCATE)
 
   go_executable(inject_hash
                 boringssl.googlesource.com/boringssl.git/util/fipstools/inject_hash)
-  if(FIPS_COFF)
-    # COFF delocate 는 해시 대상 영역 [bcm_text_start, bcm_text_end) 에 재배치가
-    # 전혀 없도록 만든다. 따라서 정적 오브젝트에서 직접 해시를 계산할 수 있어
-    # 별도의 링크된 모듈(bcm_relocated)이 필요 없다.
+  if(FIPS_COFF AND NOT FIPS_COFF_AARCH64)
+    # x86_64 COFF delocate 는 해시 대상 영역 [bcm_text_start, bcm_text_end) 에
+    # 재배치가 전혀 없도록 만든다. 따라서 정적 오브젝트에서 직접 해시를 계산할 수
+    # 있어 별도의 링크된 모듈(bcm_relocated)이 필요 없다.
     add_custom_command(
       OUTPUT bcm.o
       COMMAND ./inject_hash -o bcm.o -in-object $<TARGET_OBJECTS:bcm_hashunset>
       DEPENDS bcm_hashunset inject_hash
+      WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    )
+  elseif(FIPS_COFF_AARCH64)
+    # aarch64 COFF: 모듈에 링크 독립 재배치(adrp/:lo12:)가 남으므로 ELF 와 동일하게
+    # 링크된 모듈(bcm_relocated)을 만들어 재배치를 해소한 뒤 그 .text 를 해시한다.
+    # CMake 의 add_library(SHARED) 는 호스트(Linux) 규약(.so/ELF 링커)을 써서 COFF
+    # 크로스링크와 충돌하므로, 컴파일러를 직접 호출해 COFF DLL 을 만든다.
+    #  - /force:unresolved : 모듈 밖(꼬리)의 미해결 외부 심볼을 허용(해시 영역 밖).
+    #  - /noentry          : DLL 진입점(DllMainCRTStartup) 불필요.
+    # inject_hash 는 경계를 -in-object(COFF 심볼표)에서, 재배치 해소된 바이트를
+    # -in-hash 의 .text 에서 읽는다(링크된 PE 는 COFF 심볼표가 없을 수 있음).
+    add_custom_command(
+      OUTPUT bcm_relocated.dll
+      COMMAND ${CMAKE_C_COMPILER} ${TARGET_FLAG} -shared -nostdlib -fuse-ld=lld
+              -Wl,/force:unresolved -Wl,/noentry
+              $<TARGET_OBJECTS:bcm_hashunset>
+              -o ${CMAKE_CURRENT_BINARY_DIR}/bcm_relocated.dll
+      DEPENDS bcm_hashunset
+      WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    )
+    add_custom_command(
+      OUTPUT bcm.o
+      COMMAND ./inject_hash -o bcm.o -in-object $<TARGET_OBJECTS:bcm_hashunset>
+              -in-hash ${CMAKE_CURRENT_BINARY_DIR}/bcm_relocated.dll
+      DEPENDS bcm_hashunset inject_hash ${CMAKE_CURRENT_BINARY_DIR}/bcm_relocated.dll
       WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
     )
   else()

@@ -102,7 +102,12 @@ func do(outPath, oInput, arInput, hashInput string) error {
 	if isELFObject(hashBytes) {
 		moduleText, moduleROData, err = hashModuleELF(hashBytes, isStatic)
 	} else {
-		moduleText, moduleROData, err = hashModuleCOFF(hashBytes)
+		// COFF: 경계([start,end))는 -in-object 의 COFF 심볼표에서 얻고, 해시 대상
+		// 바이트는 hashBytes 에서 읽는다. aarch64 처럼 모듈에 링크 독립 재배치
+		// (adrp/:lo12: 등)가 남는 경우, -in-hash 로 링크된(재배치 해소된) 모듈을
+		// 넘기면 그 .text 의 같은 오프셋에서 해소된 바이트를 해시한다. 링크된 PE
+		// 이미지는 COFF 심볼표가 없을 수 있으므로 경계는 항상 오브젝트에서 얻는다.
+		moduleText, moduleROData, err = hashModuleCOFF(objectBytes, hashBytes)
 	}
 	if err != nil {
 		return err
@@ -293,22 +298,47 @@ func hashModuleELF(hashBytes []byte, isStatic bool) (moduleText, moduleROData []
 // [BORINGSSL_bcm_text_start, BORINGSSL_bcm_text_end) 에는 재배치가 전혀 없도록
 // 만들기 때문에, 정적 오브젝트에서 직접 바이트를 읽어 해시해도 런타임과 동일하다.
 // 따라서 별도의 rodata 영역은 없다.
-func hashModuleCOFF(hashBytes []byte) (moduleText, moduleROData []byte, err error) {
-	object, err := pe.NewFile(bytes.NewReader(hashBytes))
+func hashModuleCOFF(boundsBytes, dataBytes []byte) (moduleText, moduleROData []byte, err error) {
+	// 모듈 경계([start,end))는 COFF 심볼표가 있는 오브젝트(boundsBytes)에서
+	// 섹션 상대 오프셋으로 얻는다. 해시 대상 바이트는 dataBytes 의 .text 에서
+	// 같은 오프셋으로 읽는다. boundsBytes==dataBytes 면 정적 오브젝트를 직접
+	// 해시하는 기존 동작과 동일하다. 둘이 다르면(예: -in-hash 로 링크된 모듈)
+	// 링크 시 재배치가 해소된 .text 바이트를 해시한다.
+	textStart, textEnd, err := coffModuleBounds(boundsBytes)
 	if err != nil {
-		return nil, nil, errors.New("failed to parse COFF object: " + err.Error())
+		return nil, nil, err
 	}
 
-	var textSection *pe.Section
-	var textSectionNumber int
+	sectionData, err := coffTextSectionData(dataBytes)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if textStart > textEnd || textEnd > uint64(len(sectionData)) {
+		return nil, nil, fmt.Errorf("invalid module .text boundaries: start: %x, end: %x, max: %x", textStart, textEnd, len(sectionData))
+	}
+
+	moduleText = make([]byte, textEnd-textStart)
+	copy(moduleText, sectionData[textStart:textEnd])
+	return moduleText, nil, nil
+}
+
+// coffModuleBounds 는 COFF 오브젝트의 .text 심볼표에서 모듈 경계
+// (BORINGSSL_bcm_text_start/end)의 섹션 상대 오프셋을 찾는다.
+func coffModuleBounds(b []byte) (start, end uint64, err error) {
+	object, err := pe.NewFile(bytes.NewReader(b))
+	if err != nil {
+		return 0, 0, errors.New("failed to parse COFF object: " + err.Error())
+	}
+
+	textSectionNumber := 0
 	for i, section := range object.Sections {
 		if section.Name == ".text" {
-			textSection = section
 			textSectionNumber = i + 1 // COFF SectionNumber 는 1부터 시작.
 		}
 	}
-	if textSection == nil {
-		return nil, nil, errors.New("failed to find .text section in object")
+	if textSectionNumber == 0 {
+		return 0, 0, errors.New("failed to find .text section in object")
 	}
 
 	var textStart, textEnd *uint64
@@ -316,38 +346,43 @@ func hashModuleCOFF(hashBytes []byte) (moduleText, moduleROData []byte, err erro
 		if int(symbol.SectionNumber) != textSectionNumber {
 			continue
 		}
-		// COFF 오브젝트 심볼의 Value 는 섹션 시작으로부터의 오프셋이다.
 		value := uint64(symbol.Value)
 		switch symbol.Name {
 		case "BORINGSSL_bcm_text_start":
 			if textStart != nil {
-				return nil, nil, errors.New("duplicate start symbol found")
+				return 0, 0, errors.New("duplicate start symbol found")
 			}
 			textStart = &value
 		case "BORINGSSL_bcm_text_end":
 			if textEnd != nil {
-				return nil, nil, errors.New("duplicate end symbol found")
+				return 0, 0, errors.New("duplicate end symbol found")
 			}
 			textEnd = &value
 		}
 	}
-
 	if textStart == nil || textEnd == nil {
-		return nil, nil, errors.New("could not find .text module boundaries in object")
+		return 0, 0, errors.New("could not find .text module boundaries in object")
 	}
+	return *textStart, *textEnd, nil
+}
 
-	sectionData, err := textSection.Data()
+// coffTextSectionData 는 COFF/PE 의 .text 섹션 바이트를 반환한다(오브젝트 또는
+// 링크된 PE 이미지 모두). 링크된 이미지에서는 재배치가 해소된 바이트가 된다.
+func coffTextSectionData(b []byte) ([]byte, error) {
+	object, err := pe.NewFile(bytes.NewReader(b))
 	if err != nil {
-		return nil, nil, errors.New("failed to read .text section: " + err.Error())
+		return nil, errors.New("failed to parse COFF image: " + err.Error())
 	}
-
-	if *textStart > *textEnd || *textEnd > uint64(len(sectionData)) {
-		return nil, nil, fmt.Errorf("invalid module .text boundaries: start: %x, end: %x, max: %x", *textStart, *textEnd, len(sectionData))
+	for _, section := range object.Sections {
+		if section.Name == ".text" {
+			data, err := section.Data()
+			if err != nil {
+				return nil, errors.New("failed to read .text section: " + err.Error())
+			}
+			return data, nil
+		}
 	}
-
-	moduleText = make([]byte, *textEnd-*textStart)
-	copy(moduleText, sectionData[*textStart:*textEnd])
-	return moduleText, nil, nil
+	return nil, errors.New("failed to find .text section")
 }
 
 func main() {

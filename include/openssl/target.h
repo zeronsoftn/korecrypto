@@ -133,7 +133,7 @@
 // `x86_64-unknown-uefi` 타깃은 __UEFI__ 를 정의하므로, 여기서 그것으로부터
 // KORECRYPTO_BAREMETAL 을 유도하고, 추가로 UEFI 전용 글루(OPENSSL_UEFI:
 // CRYPTO_uefi_init(gBS) 를 통한 EFI_RNG 엔트로피)를 켠다.
-#if defined(__UEFI__)
+#if defined(__UEFI__) || defined(KORECRYPTO_UEFI)
 #if !defined(KORECRYPTO_BAREMETAL)
 #define KORECRYPTO_BAREMETAL
 #endif
