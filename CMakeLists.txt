@@ -478,6 +478,19 @@ if(USE_CUSTOM_LIBCXX)
     "${LIBCXXABI_DIR}/include"
   )
 
+  # KORECRYPTO(bare-metal 전용): 번들 libc++ 의 인라인 ABI 네임스페이스를 고유
+  # 이름(std::__korecrypto)으로 바꿔 빌드한다. 이 libc++/libc++abi 를 libcrypto.a 에
+  # 병합(아래 crypto POST_BUILD)해도, 모체 프로젝트가 자신의 libc++(std::__1)를 함께
+  # 링크할 때 STL 심볼이 맹글링 단계에서 갈라져 weak/COMDAT 폴딩 충돌이 나지 않는다.
+  # add_compile_definitions 는 디렉터리 전역이라 이후 정의되는 libcxx/libcxxabi/crypto
+  # 등 모든 C++ 타깃에 동일 적용된다 → 경계 너머 STL 참조가 일관되게 해소된다.
+  # (기본값은 매크로 미정의 → 네임스페이스가 리터럴 토큰 _LIBCPP_ABI_NAMESPACE 로 남는
+  #  통제 불가 상태였다.) BAREMETAL_LIBC_INCLUDE 로 게이트해 upstream 의 hosted
+  # USE_CUSTOM_LIBCXX 테스트 빌드에는 영향을 주지 않는다.
+  if(BAREMETAL_LIBC_INCLUDE)
+    add_compile_definitions(_LIBCPP_ABI_NAMESPACE=__korecrypto)
+  endif()
+
   # This is patterned after buildtools/third_party/libc++/BUILD.gn and
   # buildtools/third_party/libc++abi/BUILD.gn in Chromium.
 
@@ -916,6 +929,27 @@ if(FIPS_SHARED)
     # dependency anyway in case it starts working in some CMake version.
     DEPENDS util/fipstools/inject_hash/inject_hash.go
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+  )
+endif()
+
+if(USE_CUSTOM_LIBCXX AND KORECRYPTO_BAREMETAL)
+  # KORECRYPTO(bare-metal 전용): 함께 빌드한 번들 libc++/libc++abi 를 libcrypto.a 안으로
+  # 병합한다. 그래야 통합자가 libcrypto.a 하나만 링크하면 되고, 별도의
+  # liblibcxx.a / liblibcxxabi.a 를 신경 쓸 필요가 없다. (모체 libc++ 와의 충돌은 위
+  # _LIBCPP_ABI_NAMESPACE 격리로 회피한다.) crypto 는 link_libraries(libcxx) 로
+  # libcxx/libcxxabi 에 의존하므로 이 POST_BUILD 시점엔 두 아카이브가 이미 빌드돼 있다.
+  # CMake 는 매 재링크마다 libcrypto.a 를 새로(crypto-only) 만들고 그 직후 이 단계가
+  # 돌므로 멤버 중복 적재가 없다(스크립트가 센티넬로 한 번 더 보장).
+  add_custom_command(
+    TARGET crypto POST_BUILD
+    COMMAND ${CMAKE_COMMAND}
+            -DAR=${CMAKE_AR}
+            -DCRYPTO=$<TARGET_FILE:crypto>
+            -DLIBCXX=$<TARGET_FILE:libcxx>
+            -DLIBCXXABI=$<TARGET_FILE:libcxxabi>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/util/korecrypto-merge-libcxx.cmake
+    VERBATIM
+    COMMENT "Merging libc++/libc++abi into libcrypto.a (std::__korecrypto isolation)"
   )
 endif()
 
