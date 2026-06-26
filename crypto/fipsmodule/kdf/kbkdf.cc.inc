@@ -1,0 +1,290 @@
+// Copyright 2024 The BoringSSL / korecrypto Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// KBKDF (SP 800-108 / TTAK.KO-12.0272), HMAC-based counter and feedback modes.
+// The PRF-input encoding matches the KISA reference implementation. Verified
+// against the KISA KBKDF-HMAC-SHA256 vectors.
+
+#include <openssl/kbkdf.h>
+
+#include <openssl/digest.h>
+#include <openssl/hmac.h>
+#include <openssl/mem.h>
+
+#include <string.h>
+
+#include "../../internal.h"
+
+
+namespace {
+
+// addLparam appends |l| (the output length in bits) to |out| using the minimum
+// number of big-endian bytes, exactly as the KISA reference does. It returns
+// the number of bytes written (1..4).
+size_t kbkdf_add_l_param(uint8_t out[4], uint32_t l) {
+  if (l < 0x100) {
+    out[0] = (uint8_t)l;
+    return 1;
+  }
+  if (l < 0x10000) {
+    out[0] = (uint8_t)(l >> 8);
+    out[1] = (uint8_t)l;
+    return 2;
+  }
+  if (l < 0x1000000) {
+    out[0] = (uint8_t)(l >> 16);
+    out[1] = (uint8_t)(l >> 8);
+    out[2] = (uint8_t)l;
+    return 3;
+  }
+  out[0] = (uint8_t)(l >> 24);
+  out[1] = (uint8_t)(l >> 16);
+  out[2] = (uint8_t)(l >> 8);
+  out[3] = (uint8_t)l;
+  return 4;
+}
+
+// kbkdf_put_counter writes |ctr| as |n| big-endian bytes.
+void kbkdf_put_counter(uint8_t *out, uint32_t ctr, unsigned n) {
+  for (unsigned i = 0; i < n; i++) {
+    out[i] = (uint8_t)(ctr >> ((n - 1 - i) * 8));
+  }
+}
+
+int kbkdf_hmac(const EVP_MD *md, const uint8_t *ki, size_t ki_len,
+               unsigned counter_bytes, const uint8_t *label, size_t label_len,
+               const uint8_t *context, size_t context_len, const uint8_t *iv,
+               size_t iv_len, int feedback, uint8_t *out, size_t out_len) {
+  if (out_len == 0) {
+    return 1;
+  }
+  // counter_bytes==0 은 피드백 모드의 [NO COUNTER] 변형(카운터 미삽입)에 쓰인다.
+  if (counter_bytes > 4) {
+    return 0;
+  }
+
+  const size_t h = EVP_MD_size(md);
+  if (h == 0) {
+    return 0;
+  }
+  // L is the output length in bits; reject lengths that don't fit the encoding.
+  if (out_len > (SIZE_MAX / 8)) {
+    return 0;
+  }
+  const uint32_t l_bits = (uint32_t)(out_len * 8);
+
+  // Build the fixed suffix: Label || 0x00 || Context || [L].
+  uint8_t l_param[4];
+  size_t l_len = kbkdf_add_l_param(l_param, l_bits);
+  size_t fixed_len = label_len + 1 + context_len + l_len;
+
+  // The feedback prefix K(i-1) has length |iv_len| for the first block and |h|
+  // thereafter (matching the KISA reference, which omits the prefix entirely
+  // when the IV is empty). Size the input buffer for the larger of the two.
+  size_t max_prefix = 0;
+  if (feedback) {
+    max_prefix = iv_len > h ? iv_len : h;
+  }
+  size_t input_cap = max_prefix + counter_bytes + fixed_len;
+  uint8_t *input = reinterpret_cast<uint8_t *>(OPENSSL_malloc(input_cap));
+  if (input == nullptr) {
+    return 0;
+  }
+
+  int ret = 0;
+  uint8_t prev[EVP_MAX_MD_SIZE];
+  size_t prev_len = iv_len;  // K(0) = IV.
+  if (feedback && iv_len > 0) {
+    OPENSSL_memcpy(prev, iv, iv_len);
+  }
+
+  uint8_t block[EVP_MAX_MD_SIZE];
+  size_t done = 0;
+  uint32_t ctr = 0;
+  while (done < out_len) {
+    ctr++;
+
+    // Lay out [prefix] || [i]_r || Label || 0x00 || Context || [L].
+    uint8_t *p = input;
+    if (feedback && prev_len > 0) {
+      OPENSSL_memcpy(p, prev, prev_len);
+      p += prev_len;
+    }
+    kbkdf_put_counter(p, ctr, counter_bytes);
+    p += counter_bytes;
+    if (label_len != 0) {
+      OPENSSL_memcpy(p, label, label_len);
+    }
+    p[label_len] = 0x00;
+    if (context_len != 0) {
+      OPENSSL_memcpy(p + label_len + 1, context, context_len);
+    }
+    OPENSSL_memcpy(p + label_len + 1 + context_len, l_param, l_len);
+    p += fixed_len;
+    size_t input_len = (size_t)(p - input);
+
+    unsigned mac_len = 0;
+    if (HMAC(md, ki, ki_len, input, input_len, block, &mac_len) == nullptr ||
+        mac_len != h) {
+      goto err;
+    }
+    if (feedback) {
+      OPENSSL_memcpy(prev, block, h);
+      prev_len = h;
+    }
+
+    size_t take = out_len - done < h ? out_len - done : h;
+    OPENSSL_memcpy(out + done, block, take);
+    done += take;
+  }
+  ret = 1;
+
+err:
+  OPENSSL_cleanse(block, sizeof(block));
+  OPENSSL_cleanse(prev, sizeof(prev));
+  OPENSSL_cleanse(input, input_cap);
+  OPENSSL_free(input);
+  if (!ret) {
+    OPENSSL_cleanse(out, out_len);
+  }
+  return ret;
+}
+
+// kbkdf_hmac_dpi 는 SP 800-108 이중 파이프라인(double-pipeline) 모드.
+//   fixed = Label || 0x00 || Context || [L]
+//   A(0) = fixed,  A(i) = HMAC(KI, A(i-1))
+//   K(i) = HMAC(KI, A(i) || [i]_r || fixed)   ([i] 는 counter_bytes>0 일 때만)
+int kbkdf_hmac_dpi(const EVP_MD *md, const uint8_t *ki, size_t ki_len,
+                   unsigned counter_bytes, const uint8_t *label,
+                   size_t label_len, const uint8_t *context,
+                   size_t context_len, uint8_t *out, size_t out_len) {
+  if (out_len == 0) {
+    return 1;
+  }
+  if (counter_bytes > 4) {
+    return 0;
+  }
+  const size_t h = EVP_MD_size(md);
+  if (h == 0 || out_len > (SIZE_MAX / 8)) {
+    return 0;
+  }
+  const uint32_t l_bits = (uint32_t)(out_len * 8);
+  uint8_t l_param[4];
+  size_t l_len = kbkdf_add_l_param(l_param, l_bits);
+  size_t fixed_len = label_len + 1 + context_len + l_len;
+
+  int ret = 0;
+  uint8_t *fixed = reinterpret_cast<uint8_t *>(OPENSSL_malloc(fixed_len));
+  uint8_t *kin =
+      reinterpret_cast<uint8_t *>(OPENSSL_malloc(h + counter_bytes + fixed_len));
+  if (fixed == nullptr || kin == nullptr) {
+    goto err;
+  }
+  // fixed = Label || 0x00 || Context || [L]
+  if (label_len != 0) {
+    OPENSSL_memcpy(fixed, label, label_len);
+  }
+  fixed[label_len] = 0x00;
+  if (context_len != 0) {
+    OPENSSL_memcpy(fixed + label_len + 1, context, context_len);
+  }
+  OPENSSL_memcpy(fixed + label_len + 1 + context_len, l_param, l_len);
+
+  {
+    uint8_t a[EVP_MAX_MD_SIZE], block[EVP_MAX_MD_SIZE];
+    size_t done = 0;
+    uint32_t ctr = 0;
+    unsigned mac_len = 0;
+    int first = 1;
+    while (done < out_len) {
+      ctr++;
+      // A(i) = HMAC(KI, A(i-1)). A(0)=fixed → 첫 회는 fixed 입력.
+      if (first) {
+        if (HMAC(md, ki, ki_len, fixed, fixed_len, a, &mac_len) == nullptr) {
+          goto err;
+        }
+        first = 0;
+      } else {
+        uint8_t tmp[EVP_MAX_MD_SIZE];
+        if (HMAC(md, ki, ki_len, a, h, tmp, &mac_len) == nullptr) {
+          goto err;
+        }
+        OPENSSL_memcpy(a, tmp, h);
+      }
+      // K(i) = HMAC(KI, A(i) || [i]_r || fixed)
+      uint8_t *p = kin;
+      OPENSSL_memcpy(p, a, h);
+      p += h;
+      kbkdf_put_counter(p, ctr, counter_bytes);
+      p += counter_bytes;
+      OPENSSL_memcpy(p, fixed, fixed_len);
+      if (HMAC(md, ki, ki_len, kin, h + counter_bytes + fixed_len, block,
+               &mac_len) == nullptr ||
+          mac_len != h) {
+        goto err;
+      }
+      size_t take = out_len - done < h ? out_len - done : h;
+      OPENSSL_memcpy(out + done, block, take);
+      done += take;
+    }
+    OPENSSL_cleanse(a, sizeof(a));
+    OPENSSL_cleanse(block, sizeof(block));
+  }
+  ret = 1;
+
+err:
+  if (fixed != nullptr) {
+    OPENSSL_free(fixed);
+  }
+  if (kin != nullptr) {
+    OPENSSL_cleanse(kin, h + counter_bytes + fixed_len);
+    OPENSSL_free(kin);
+  }
+  if (!ret) {
+    OPENSSL_cleanse(out, out_len);
+  }
+  return ret;
+}
+
+}  // namespace
+
+extern "C" {
+
+int KBKDF_hmac_counter(const EVP_MD *md, const uint8_t *ki, size_t ki_len,
+                       unsigned counter_bytes, const uint8_t *label,
+                       size_t label_len, const uint8_t *context,
+                       size_t context_len, uint8_t *out, size_t out_len) {
+  return kbkdf_hmac(md, ki, ki_len, counter_bytes, label, label_len, context,
+                    context_len, nullptr, 0, /*feedback=*/0, out, out_len);
+}
+
+int KBKDF_hmac_feedback(const EVP_MD *md, const uint8_t *ki, size_t ki_len,
+                        unsigned counter_bytes, const uint8_t *label,
+                        size_t label_len, const uint8_t *context,
+                        size_t context_len, const uint8_t *iv, size_t iv_len,
+                        uint8_t *out, size_t out_len) {
+  return kbkdf_hmac(md, ki, ki_len, counter_bytes, label, label_len, context,
+                    context_len, iv, iv_len, /*feedback=*/1, out, out_len);
+}
+
+int KBKDF_hmac_double_pipeline(const EVP_MD *md, const uint8_t *ki,
+                               size_t ki_len, unsigned counter_bytes,
+                               const uint8_t *label, size_t label_len,
+                               const uint8_t *context, size_t context_len,
+                               uint8_t *out, size_t out_len) {
+  return kbkdf_hmac_dpi(md, ki, ki_len, counter_bytes, label, label_len,
+                        context, context_len, out, out_len);
+}
+
+}  // extern "C"

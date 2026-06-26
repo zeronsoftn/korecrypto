@@ -229,6 +229,159 @@ if(GCOV)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fprofile-arcs -ftest-coverage")
 endif()
 
+# bare-metal(freestanding) 빌드 지원. clang 의 x86_64-unknown-uefi 같은 freestanding
+# 타깃은 hosted libc 가 없으므로, BoringSSL 이 include 하는 hosted 헤더(stdlib/
+# string/...)는 외부에서 제공하는 freestanding C 라이브러리(예: picolibc)가 공급한다.
+# 그 include 디렉터리는 BAREMETAL_LIBC_INCLUDE 캐시 변수로 전달한다.
+#
+# 두 개의 플래그로 관심사를 분리한다:
+#   - KORECRYPTO_BAREMETAL: 범용 bare-metal 머신러리(외부 libc include, 예외/스레드
+#       OFF, 번들 libc++)를 켜는 플래그. UEFI triple 이면 자동 ON. 다른 bare-metal
+#       타깃(예: ELF freestanding)은 -DKORECRYPTO_BAREMETAL=ON 으로 명시한다.
+#   - KORECRYPTO_UEFI: UEFI 환경 전용 글루(__EDK2_BORINGSSL__ 등). UEFI triple 일 때만 ON.
+
+option(KORECRYPTO_BAREMETAL "Build for a generic bare-metal (freestanding) target" OFF)
+option(KORECRYPTO_UEFI "Build for a UEFI target" OFF)
+
+if(CMAKE_C_COMPILER_TARGET MATCHES "uefi" OR CMAKE_ASM_COMPILER_TARGET MATCHES "uefi")
+  set(KORECRYPTO_UEFI ON)
+endif()
+
+if(KORECRYPTO_UEFI)
+  set(KORECRYPTO_BAREMETAL ON)
+  add_definitions(-DKORECRYPTO_UEFI -D__UEFI__)
+  add_compile_options(
+    "$<$<COMPILE_LANGUAGE:C,CXX>:-U_WIN32;-ffreestanding>"
+  )
+
+  # UEFI 환경 전용. BORINGSSL_CAN_DIVIDE_UINT128 을 비활성화 하기 위함
+  # rustc 에서의 x86_64-unknown-uefi target 이 clang 의 x86_64-unknown-uefi 와 abi 가 다른 문제가 있다.
+  # https://github.com/rust-lang/rust/issues/158292
+  add_definitions(-D__EDK2_BORINGSSL__)
+endif()
+
+set(BAREMETAL_LIBC_INCLUDE "" CACHE PATH
+    "Include dir of an external freestanding C library (e.g. picolibc) for bare-metal builds")
+if(KORECRYPTO_BAREMETAL)
+  if(NOT BAREMETAL_LIBC_INCLUDE)
+    message(FATAL_ERROR
+      "bare-metal (freestanding) build requires a libc include dir. Set -DBAREMETAL_LIBC_INCLUDE=<dir>")
+  endif()
+  message(STATUS "bare-metal freestanding build: using libc include ${BAREMETAL_LIBC_INCLUDE}")
+
+  # freestanding libc 헤더를 -isystem 으로 추가한다(헤더 경고 억제). clang 의 resource
+  # 헤더(stddef/stdarg 등)는 시스템 검색 경로에 그대로 남고, picolibc 의 stdint.h
+  # 는 include_next 로 그 resource stdint.h 를 가져오므로 libc 가 더 앞서야 한다.
+  # freestanding 타깃은 sysroot 가 없어 host glibc 경로가 섞이지 않는다.
+  # (libc++ 의 <cstdlib> 등은 include_next 로 이 C <stdlib.h> 를 찾으므로, 아래
+  #  USE_CUSTOM_LIBCXX 블록의 libc++ include 가 더 앞서야 한다.)
+  include_directories(SYSTEM "${BAREMETAL_LIBC_INCLUDE}")
+  # 단일스레드 bare-metal: 함수 지역 정적의 스레드안전 가드(__cxa_guard_*)를 생성하지
+  # 않는다. 이러면 libc++abi 의 cxa_guard 도 필요 없어진다.
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-threadsafe-statics>)
+  # 예외 비활성. bare-metal 은 예외를 쓰지 않으며, 또한 uefi 타깃에서 clang-22 이
+  # 예외 관련 코드(예: operator new 의 bad_alloc throw, terminate/personality) 생성
+  # 중 충돌(SIGSEGV)하므로 -fno-exceptions 로 그 코드젠을 제거한다. libc++/libc++abi
+  # 와 boringssl 모두에 적용된다.
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions>)
+  # libc++ 헤더는 __config_site 로 스레드 OFF 지만, 업스트림 블록은 libc++abi
+  # 소스를 별도 컴파일 정의 없이 빌드한다. libc++abi 소스가 스레드 OFF 경로를
+  # 쓰도록 _LIBCXXABI_HAS_NO_THREADS 를 정의해 libc++(스레드 OFF)와 일치시킨다.
+  add_definitions(-D_LIBCXXABI_HAS_NO_THREADS)
+
+  # bare-metal 타깃에 KORECRYPTO_BAREMETAL C 매크로를 정의해 target.h 의 NO_*
+  # (FILESYSTEM/POSIX_IO/SOCK/THREADS) 그룹을 켠다. UEFI 는 __UEFI__ 로부터 이
+  # 매크로를 자동 유도하지만, target.h 가 #ifndef 가드를 두므로 중복 정의 경고
+  # 없이 안전하다.
+  add_definitions(-DKORECRYPTO_BAREMETAL)
+
+  set(CMAKE_C_LINK_FLAGS "${CMAKE_C_LINK_FLAGS} -nostdlib")
+  set(CMAKE_CXX_LINK_FLAGS "${CMAKE_CXX_LINK_FLAGS} -nostdlib++")
+endif()
+
+# USE_CUSTOM_LIBCXX: BoringSSL 의 C++ 코드는 STL(vector/memory/optional/...)을 쓴다.
+# UEFI(freestanding)에는 C++ 표준 라이브러리가 없고 libstdc++ 는 glibc 결합도가 높아
+# 못 쓰므로, llvm-project(llvmorg-21.1.8)를 받아 libc++/libc++abi/libunwind 를 UEFI
+# 타깃으로 freestanding 빌드(exception/thread/locale/filesystem 없음)해서 사용한다.
+# 헤더가 본 빌드보다 먼저 있어야 하므로 configure 단계에서 받아서 빌드한다(한 번만).
+if(USE_CUSTOM_LIBCXX)
+  # 번들 libc++/libc++abi 는 llvm-project 를 받아 boringssl 과 동일한 (UEFI) 툴체인으로
+  # 함께 컴파일한다. freestanding 구성(exception/thread/locale off 등)은
+  # util/bot/libcxx-config 의 __config_site / __assertion_handler 가 제공한다.
+  #
+  # clang 버전 요구사항: clang >= 22 만 지원한다. clang 21 이하의 x86_64-unknown-uefi
+  # C++ 프런트엔드는 `[[no_unique_address]]` 를 인식하지 못해(Microsoft C++ ABI 취급)
+  # libc++ 의 std::string SSO(`__short`) static_assert 가 깨진다. clang 22 가 uefi
+  # 타깃 지원을 추가했다.
+  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR "USE_CUSTOM_LIBCXX requires Clang (got ${CMAKE_CXX_COMPILER_ID})")
+  endif()
+  if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 22)
+    message(FATAL_ERROR
+      "USE_CUSTOM_LIBCXX requires clang >= 22 (got ${CMAKE_CXX_COMPILER_VERSION}). "
+      "clang <= 21 lacks [[no_unique_address]] support for the x86_64-unknown-uefi "
+      "target, which breaks libc++ std::string.")
+  endif()
+
+  # libc++ 는 컴파일러(clang) 버전과 정확히 같은 릴리스를 써야 한다. 받을 태그를
+  # 컴파일러 버전에서 유도한다(예: clang 22.1.8 → llvmorg-22.1.8). 비표준 버전
+  # 문자열이면 LIBCXX_LLVM_TAG 로 직접 덮어쓴다.
+  set(LIBCXX_LLVM_TAG "llvmorg-${CMAKE_CXX_COMPILER_VERSION}" CACHE STRING
+      "llvm-project git tag for the bundled libc++ (must match the clang version)")
+
+  # llvm-project 클론은 빌드 디렉터리(CMAKE_CURRENT_BINARY_DIR) 아래에 둔다. 소스
+  # 트리(util/bot)를 오염시키지 않고 심볼릭 링크도 만들지 않는다. 클론 경로를 직접
+  # 참조한다.
+  set(LIBCXX_LLVM_SRC "${CMAKE_CURRENT_BINARY_DIR}/llvm-project-src")
+  set(LIBCXX_DIR "${LIBCXX_LLVM_SRC}/libcxx")
+  set(LIBCXXABI_DIR "${LIBCXX_LLVM_SRC}/libcxxabi")
+  set(LLVM_LIBC_DIR "${LIBCXX_LLVM_SRC}/libc")
+  set(LIBCXX_CONFIG_DIR "${PROJECT_SOURCE_DIR}/util/bot/libcxx-config")
+
+  set(_llvm_tag_marker "${LIBCXX_LLVM_SRC}/.korecrypto-llvm-tag")
+  set(_have_tag "")
+  if(EXISTS "${_llvm_tag_marker}")
+    file(READ "${_llvm_tag_marker}" _have_tag)
+    string(STRIP "${_have_tag}" _have_tag)
+  endif()
+  # 디렉터리가 없거나, 태그가 바뀌었으면(예: clang 버전 변경) 다시 받는다.
+  if(NOT EXISTS "${LIBCXX_DIR}/CMakeLists.txt" OR
+     NOT "${_have_tag}" STREQUAL "${LIBCXX_LLVM_TAG}")
+    message(STATUS "USE_CUSTOM_LIBCXX: (re)fetching llvm-project ${LIBCXX_LLVM_TAG} "
+                   "(clang ${CMAKE_CXX_COMPILER_VERSION}) into ${LIBCXX_LLVM_SRC}")
+    file(REMOVE_RECURSE "${LIBCXX_LLVM_SRC}")
+    execute_process(
+      COMMAND git clone --depth 1 --branch "${LIBCXX_LLVM_TAG}"
+              https://github.com/llvm/llvm-project.git "${LIBCXX_LLVM_SRC}"
+      RESULT_VARIABLE _rc)
+    if(_rc)
+      message(FATAL_ERROR "llvm-project clone 실패 (rc=${_rc})")
+    endif()
+    file(WRITE "${_llvm_tag_marker}" "${LIBCXX_LLVM_TAG}\n")
+  endif()
+
+  # libc++ 헤더가 picolibc(C 헤더)보다 먼저 검색되어야 한다. libc++ 의 <cstdlib> 는
+  # 자신의 <stdlib.h> 래퍼를 먼저 찾은 뒤 include_next 로 picolibc 의 C <stdlib.h> 를
+  # 가져오기 때문이다. picolibc 는 KORECRYPTO_UEFI 블록에서 먼저 등록되므로, 여기서
+  # BEFORE 로 prepend 해 libc++ 우선순위를 높인다.
+  include_directories(BEFORE SYSTEM
+    "${LIBCXX_CONFIG_DIR}"
+    "${LIBCXX_DIR}/include"
+    "${LIBCXXABI_DIR}/include")
+
+  if(KORECRYPTO_BAREMETAL)
+    add_definitions(-D_LIBPCPP_DEFINE_NEW_HANDLER=1)
+  endif()
+
+  if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    # UEFI 는 LLP64(long=32)라 clang 이 __LP64__ 를 정의하지 않는다. 그러나 libc++abi 의
+    # __cxa_exception 레이아웃은 __LP64__ 로 64비트(포인터) 레이아웃을 선택하며, 이게
+    # 없으면 _Unwind_Exception(aligned 16) 과 어긋나 static_assert 가 깨진다. 64비트
+    # 포인터 환경이므로 LP64 레이아웃이 맞다 → 공통으로 정의한다.
+    add_definitions(-D__LP64__=1)
+  endif()
+endif()
+
 if(FIPS)
   require_go()
   add_definitions(-DBORINGSSL_FIPS)
@@ -280,7 +433,13 @@ if(FIPS_DELOCATE OR NOT OPENSSL_NO_ASM)
     if (NOT OPENSSL_NO_ASM)
       set(OPENSSL_ASM TRUE)
     endif()
-    if(NOT WIN32)
+    if(KORECRYPTO_UEFI)
+      # UEFI 는 COFF/PE 형식(MS x64 ABI)이므로 mingw64 플레이버를 사용한다.
+      # clang 은 x86_64-unknown-uefi 에서 _WIN32 를 정의하지 않으므로 직접 주입해
+      # gen/bcm/*-mingw64.S 파일의 #if defined(_WIN32) 가드를 활성화한다.
+      # -Wa,--noexecstack 은 ELF 전용 섹션 메타데이터이므로 COFF 타깃에는 추가하지 않는다.
+      set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -D_WIN32")
+    elseif(NOT WIN32)
       set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -Wa,--noexecstack")
     endif()
     # Clang's integrated assembler does not support debug symbols.
@@ -310,29 +469,77 @@ if(USE_CUSTOM_LIBCXX)
   # CMAKE_CXX_FLAGS ends up in the linker flags as well, so use
   # add_compile_options. There does not appear to be a way to set
   # language-specific compile-only flags.
-  add_compile_options("-nostdinc++")
-  set(CMAKE_CXX_LINK_FLAGS "${CMAKE_CXX_LINK_FLAGS} -nostdlib++")
+  add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-nostdinc++>")
+
   include_directories(
     SYSTEM
-    util/bot/libcxx-config
-    util/bot/libcxx/include
-    util/bot/libcxxabi/include
+    "${LIBCXX_CONFIG_DIR}"
+    "${LIBCXX_DIR}/include"
+    "${LIBCXXABI_DIR}/include"
   )
+
+  # KORECRYPTO(bare-metal 전용): 번들 libc++ 의 인라인 ABI 네임스페이스를 고유
+  # 이름(std::__korecrypto)으로 바꿔 빌드한다. 이 libc++/libc++abi 를 libcrypto.a 에
+  # 병합(아래 crypto POST_BUILD)해도, 모체 프로젝트가 자신의 libc++(std::__1)를 함께
+  # 링크할 때 STL 심볼이 맹글링 단계에서 갈라져 weak/COMDAT 폴딩 충돌이 나지 않는다.
+  # add_compile_definitions 는 디렉터리 전역이라 이후 정의되는 libcxx/libcxxabi/crypto
+  # 등 모든 C++ 타깃에 동일 적용된다 → 경계 너머 STL 참조가 일관되게 해소된다.
+  # (기본값은 매크로 미정의 → 네임스페이스가 리터럴 토큰 _LIBCPP_ABI_NAMESPACE 로 남는
+  #  통제 불가 상태였다.) BAREMETAL_LIBC_INCLUDE 로 게이트해 upstream 의 hosted
+  # USE_CUSTOM_LIBCXX 테스트 빌드에는 영향을 주지 않는다.
+  if(BAREMETAL_LIBC_INCLUDE)
+    add_compile_definitions(_LIBCPP_ABI_NAMESPACE=__korecrypto)
+  endif()
 
   # This is patterned after buildtools/third_party/libc++/BUILD.gn and
   # buildtools/third_party/libc++abi/BUILD.gn in Chromium.
 
-  file(GLOB LIBCXX_SOURCES "util/bot/libcxx/src/*.cpp")
-  file(GLOB LIBCXXABI_SOURCES "util/bot/libcxxabi/src/*.cpp")
+  file(GLOB LIBCXX_SOURCES "${LIBCXX_DIR}/src/*.cpp")
+  file(GLOB LIBCXXABI_SOURCES "${LIBCXXABI_DIR}/src/*.cpp")
 
+  # NOTE: file(GLOB) 는 절대경로를 돌려주므로 REMOVE_ITEM 도 절대경로로 맞춘다.
+  set(_libcxxabi_src "${LIBCXXABI_DIR}/src")
   # This file is meant for exception-less builds.
-  list(REMOVE_ITEM LIBCXXABI_SOURCES "trunk/src/cxa_noexception.cpp")
+  list(REMOVE_ITEM LIBCXXABI_SOURCES "${_libcxxabi_src}/cxa_noexception.cpp")
   # libc++ also defines new and delete.
-  list(REMOVE_ITEM LIBCXXABI_SOURCES "trunk/src/stdlib_new_delete.cpp")
+  list(REMOVE_ITEM LIBCXXABI_SOURCES "${_libcxxabi_src}/stdlib_new_delete.cpp")
   if(TSAN)
     # ThreadSanitizer tries to intercept these symbols. Skip them to avoid
     # symbol conflicts.
-    list(REMOVE_ITEM LIBCXXABI_SOURCES "trunk/src/cxa_guard.cpp")
+    list(REMOVE_ITEM LIBCXXABI_SOURCES "${_libcxxabi_src}/cxa_guard.cpp")
+  endif()
+  if(KORECRYPTO_BAREMETAL)
+    # bare-metal(freestanding, 예외 OFF, 스레드 OFF):
+    #  - cxa_personality.cpp: Itanium 예외 personality. -fno-exceptions 라 불필요하고
+    #    uefi 타깃에서 clang 코드젠이 충돌(SIGSEGV)한다.
+    #  - cxa_guard.cpp: 스레드 안전 정적초기화 가드. 단일스레드라 불필요하며,
+    #    스레드 OFF 에서 std::__libcpp_mutex 등을 참조해 컴파일되지 않는다.
+    #  - cxa_thread_atexit.cpp: 스레드 지역 소멸자(TLS). 스레드 OFF 라 불필요하고
+    #    std::__libcpp_tls_* 를 참조해 컴파일되지 않는다.
+    #  - cxa_handlers.cpp: terminate/unexpected 핸들러. -fno-exceptions 라 참조되지
+    #    않으며, 이 타깃에서 clang 이 std::__terminate 코드젠 중 충돌(SIGSEGV)한다.
+    # (crypto.a 는 libc++ 헤더만 필요하고 이 .cpp 들을 링크하지 않으므로 안전하다.)
+    list(REMOVE_ITEM LIBCXXABI_SOURCES "${_libcxxabi_src}/cxa_personality.cpp")
+    list(REMOVE_ITEM LIBCXXABI_SOURCES "${_libcxxabi_src}/cxa_guard.cpp")
+    list(REMOVE_ITEM LIBCXXABI_SOURCES "${_libcxxabi_src}/cxa_thread_atexit.cpp")
+    list(REMOVE_ITEM LIBCXXABI_SOURCES "${_libcxxabi_src}/cxa_handlers.cpp")
+
+    # libc++ 라이브러리의 host 의존 런타임 소스를 제외한다. UEFI(freestanding)에는
+    # thread/locale/iostream/filesystem/os clock/RND device가 없어 이들이 컴파일되지
+    # 않는다. crypto.a 는 libc++ 헤더만 쓰고 이 .cpp 들을 링크하지 않으므로 안전.
+    set(_libcxx_src "${LIBCXX_DIR}/src")
+    foreach(_f
+            # 스레드/동기화
+            atomic barrier call_once condition_variable
+            condition_variable_destructor future mutex mutex_destructor
+            shared_mutex thread
+            # locale/iostream
+            locale ios ios.instantiations iostream ostream fstream strstream
+            regex print
+            # OS 시계/난수
+            chrono random random_shuffle)
+      list(REMOVE_ITEM LIBCXX_SOURCES "${_libcxx_src}/${_f}.cpp")
+    endforeach()
   endif()
 
   add_library(libcxxabi ${LIBCXXABI_SOURCES})
@@ -356,7 +563,7 @@ if(USE_CUSTOM_LIBCXX)
     -DLIBC_NAMESPACE=bssl_llvm_libc
   )
   # LLVM libc++ depends on some shared headers from LLVM libc.
-  target_include_directories(libcxx PRIVATE util/bot/llvm-libc)
+  target_include_directories(libcxx PRIVATE "${LLVM_LIBC_DIR}")
   set_target_properties(
     libcxx libcxxabi PROPERTIES
     # libc++ and libc++abi must be built in C++23 mode.
@@ -364,7 +571,7 @@ if(USE_CUSTOM_LIBCXX)
     CXX_STANDARD_REQUIRED TRUE
   )
   # libc++abi depends on libc++ internal headers.
-  set_property(TARGET libcxx libcxxabi APPEND PROPERTY INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/util/bot/libcxx/src")
+  set_property(TARGET libcxx libcxxabi APPEND PROPERTY INCLUDE_DIRECTORIES "${LIBCXX_DIR}/src")
   target_link_libraries(libcxx libcxxabi)
 
   # Link all subsequent libraries to the custom libc++.
@@ -569,9 +776,35 @@ if(FIPS_DELOCATE)
     target_compile_options(bcm_c_generated_asm PRIVATE "-fno-lto" "-fno-sanitize=cfi")
   endif()
 
+  # 어셈블리 전처리에 사용할 타깃 플래그. ASM 타깃이 따로 지정되지 않았으면
+  # C 컴파일러 타깃으로 대체한다(윈도우 크로스컴파일 시 필요).
   set(TARGET_FLAG "")
   if(CMAKE_ASM_COMPILER_TARGET)
     set(TARGET_FLAG "--target=${CMAKE_ASM_COMPILER_TARGET}")
+  elseif(CMAKE_C_COMPILER_TARGET)
+    set(TARGET_FLAG "--target=${CMAKE_C_COMPILER_TARGET}")
+  endif()
+
+  # COFF/PE(윈도우 x86_64-w64-windows-gnu, 또는 UEFI x86_64-unknown-uefi) 대상인지
+  # 판별한다. CMake 의 WIN32 는 호스트가 리눅스이고 CMAKE_SYSTEM_NAME 을 바꾸지
+  # 않으므로 신뢰할 수 없어, 컴파일러 타깃 트리플로 직접 판단한다. UEFI 도 PE/COFF
+  # 이므로 동일하게 reloc-free 모듈을 직접 해시한다(별도 링크 모듈 불필요).
+  set(FIPS_COFF FALSE)
+  if(CMAKE_C_COMPILER_TARGET MATCHES "windows" OR
+     CMAKE_ASM_COMPILER_TARGET MATCHES "windows" OR
+     CMAKE_C_COMPILER_TARGET MATCHES "uefi" OR
+     CMAKE_ASM_COMPILER_TARGET MATCHES "uefi")
+    set(FIPS_COFF TRUE)
+  endif()
+
+  # COFF/aarch64 판별. x86_64 COFF 는 모듈이 완전히 재배치-프리(rip-relative 를
+  # 어셈블러가 해소)지만, aarch64 는 adrp/:lo12: 가 링크 시 해소되는 "링크 독립"
+  # 재배치를 남긴다(ELF 와 동일). 따라서 aarch64 는 정적 오브젝트가 아니라 링크되어
+  # 재배치가 해소된 모듈을 해시해야 런타임 무결성 검사와 일치한다.
+  set(FIPS_COFF_AARCH64 FALSE)
+  if(FIPS_COFF AND (CMAKE_C_COMPILER_TARGET MATCHES "aarch64" OR
+                    CMAKE_ASM_COMPILER_TARGET MATCHES "aarch64"))
+    set(FIPS_COFF_AARCH64 TRUE)
   endif()
 
   go_executable(delocate boringssl.googlesource.com/boringssl.git/util/fipstools/delocate)
@@ -593,21 +826,58 @@ if(FIPS_DELOCATE)
 
   add_library(bcm_hashunset OBJECT bcm-delocated.S)
 
-  # bcm_hashunset may still have relocations, just link-independent ones. Link a
-  # sample shared object before computing the hash.
-  add_library(bcm_relocated SHARED $<TARGET_OBJECTS:bcm_hashunset>)
-  set_target_properties(bcm_relocated PROPERTIES LINKER_LANGUAGE CXX)
-  target_link_options(bcm_relocated PRIVATE "-Wl,-z,undefs")
-
   go_executable(inject_hash
                 boringssl.googlesource.com/boringssl.git/util/fipstools/inject_hash)
-  add_custom_command(
-    OUTPUT bcm.o
-    COMMAND ./inject_hash -o bcm.o -in-object $<TARGET_OBJECTS:bcm_hashunset>
-            -in-hash $<TARGET_FILE:bcm_relocated>
-    DEPENDS bcm_hashunset bcm_relocated inject_hash
-    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
-  )
+  if(FIPS_COFF AND NOT FIPS_COFF_AARCH64)
+    # x86_64 COFF delocate 는 해시 대상 영역 [bcm_text_start, bcm_text_end) 에
+    # 재배치가 전혀 없도록 만든다. 따라서 정적 오브젝트에서 직접 해시를 계산할 수
+    # 있어 별도의 링크된 모듈(bcm_relocated)이 필요 없다.
+    add_custom_command(
+      OUTPUT bcm.o
+      COMMAND ./inject_hash -o bcm.o -in-object $<TARGET_OBJECTS:bcm_hashunset>
+      DEPENDS bcm_hashunset inject_hash
+      WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    )
+  elseif(FIPS_COFF_AARCH64)
+    # aarch64 COFF: 모듈에 링크 독립 재배치(adrp/:lo12:)가 남으므로 ELF 와 동일하게
+    # 링크된 모듈(bcm_relocated)을 만들어 재배치를 해소한 뒤 그 .text 를 해시한다.
+    # CMake 의 add_library(SHARED) 는 호스트(Linux) 규약(.so/ELF 링커)을 써서 COFF
+    # 크로스링크와 충돌하므로, 컴파일러를 직접 호출해 COFF DLL 을 만든다.
+    #  - /force:unresolved : 모듈 밖(꼬리)의 미해결 외부 심볼을 허용(해시 영역 밖).
+    #  - /noentry          : DLL 진입점(DllMainCRTStartup) 불필요.
+    # inject_hash 는 경계를 -in-object(COFF 심볼표)에서, 재배치 해소된 바이트를
+    # -in-hash 의 .text 에서 읽는다(링크된 PE 는 COFF 심볼표가 없을 수 있음).
+    add_custom_command(
+      OUTPUT bcm_relocated.dll
+      COMMAND ${CMAKE_C_COMPILER} ${TARGET_FLAG} -shared -nostdlib -fuse-ld=lld
+              -Wl,/force:unresolved -Wl,/noentry
+              $<TARGET_OBJECTS:bcm_hashunset>
+              -o ${CMAKE_CURRENT_BINARY_DIR}/bcm_relocated.dll
+      DEPENDS bcm_hashunset
+      WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    )
+    add_custom_command(
+      OUTPUT bcm.o
+      COMMAND ./inject_hash -o bcm.o -in-object $<TARGET_OBJECTS:bcm_hashunset>
+              -in-hash ${CMAKE_CURRENT_BINARY_DIR}/bcm_relocated.dll
+      DEPENDS bcm_hashunset inject_hash ${CMAKE_CURRENT_BINARY_DIR}/bcm_relocated.dll
+      WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    )
+  else()
+    # bcm_hashunset may still have relocations, just link-independent ones. Link a
+    # sample shared object before computing the hash.
+    add_library(bcm_relocated SHARED $<TARGET_OBJECTS:bcm_hashunset>)
+    set_target_properties(bcm_relocated PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(bcm_relocated PRIVATE "-Wl,-z,undefs")
+
+    add_custom_command(
+      OUTPUT bcm.o
+      COMMAND ./inject_hash -o bcm.o -in-object $<TARGET_OBJECTS:bcm_hashunset>
+              -in-hash $<TARGET_FILE:bcm_relocated>
+      DEPENDS bcm_hashunset bcm_relocated inject_hash
+      WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    )
+  endif()
   set(CRYPTO_FIPS_OBJECTS bcm.o)
 elseif(FIPS_SHARED)
   if(NOT BUILD_SHARED_LIBS)
@@ -659,6 +929,27 @@ if(FIPS_SHARED)
     # dependency anyway in case it starts working in some CMake version.
     DEPENDS util/fipstools/inject_hash/inject_hash.go
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+  )
+endif()
+
+if(USE_CUSTOM_LIBCXX AND KORECRYPTO_BAREMETAL)
+  # KORECRYPTO(bare-metal 전용): 함께 빌드한 번들 libc++/libc++abi 를 libcrypto.a 안으로
+  # 병합한다. 그래야 통합자가 libcrypto.a 하나만 링크하면 되고, 별도의
+  # liblibcxx.a / liblibcxxabi.a 를 신경 쓸 필요가 없다. (모체 libc++ 와의 충돌은 위
+  # _LIBCPP_ABI_NAMESPACE 격리로 회피한다.) crypto 는 link_libraries(libcxx) 로
+  # libcxx/libcxxabi 에 의존하므로 이 POST_BUILD 시점엔 두 아카이브가 이미 빌드돼 있다.
+  # CMake 는 매 재링크마다 libcrypto.a 를 새로(crypto-only) 만들고 그 직후 이 단계가
+  # 돌므로 멤버 중복 적재가 없다(스크립트가 센티넬로 한 번 더 보장).
+  add_custom_command(
+    TARGET crypto POST_BUILD
+    COMMAND ${CMAKE_COMMAND}
+            -DAR=${CMAKE_AR}
+            -DCRYPTO=$<TARGET_FILE:crypto>
+            -DLIBCXX=$<TARGET_FILE:libcxx>
+            -DLIBCXXABI=$<TARGET_FILE:libcxxabi>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/util/korecrypto-merge-libcxx.cmake
+    VERBATIM
+    COMMENT "Merging libc++/libc++abi into libcrypto.a (std::__korecrypto isolation)"
   )
 endif()
 

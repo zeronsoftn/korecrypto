@@ -16,7 +16,9 @@
 #include <limits.h>
 #include <string.h>
 
-#if defined(BORINGSSL_FIPS)
+#if defined(BORINGSSL_FIPS) && !defined(KORECRYPTO_BAREMETAL)
+// unistd.h 는 POSIX 전용이며 이 파일에서 실제로 쓰이지 않는다.
+// bare-metal(freestanding, 예: UEFI)에는 없으므로 포함하지 않는다.
 #include <unistd.h>
 #endif
 

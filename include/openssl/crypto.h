@@ -46,6 +46,14 @@ OPENSSL_EXPORT int CRYPTO_is_confidential_build(void);
 // in which case it returns zero.
 OPENSSL_EXPORT int CRYPTO_has_asm(void);
 
+#if defined(OPENSSL_UEFI)
+// CRYPTO_uefi_init must be called once, early during UEFI startup, before any
+// other BoringSSL function. `boot_services` is the EFI_BOOT_SERVICES table
+// pointer (gBS). BoringSSL uses it to obtain entropy via EFI_RNG_PROTOCOL. This
+// function only exists on UEFI (freestanding) builds.
+OPENSSL_EXPORT void CRYPTO_uefi_init(void *boot_services);
+#endif
+
 // BORINGSSL_self_test triggers most of the FIPS KAT-based self tests. It
 // returns one on success and zero on error. It currently skips the SLH-DSA
 // tests, which take a really long time to run.

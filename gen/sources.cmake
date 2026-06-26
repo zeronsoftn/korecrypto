@@ -33,6 +33,11 @@ set(
   crypto/fipsmodule/aes/key_wrap.cc.inc
   crypto/fipsmodule/aes/mode_wrappers.cc.inc
   crypto/fipsmodule/aes/ofb.cc.inc
+  crypto/fipsmodule/aria/aria.cc.inc
+  crypto/fipsmodule/lea/lea.cc.inc
+  crypto/fipsmodule/seed/seed.cc.inc
+  crypto/fipsmodule/hight/hight.cc.inc
+  crypto/fipsmodule/lsh/lsh.cc.inc
   crypto/fipsmodule/bn/add.cc.inc
   crypto/fipsmodule/bn/asm/x86_64-gcc.cc.inc
   crypto/fipsmodule/bn/bn.cc.inc
@@ -58,6 +63,10 @@ set(
   crypto/fipsmodule/cipher/cipher.cc.inc
   crypto/fipsmodule/cipher/e_aes.cc.inc
   crypto/fipsmodule/cipher/e_aesccm.cc.inc
+  crypto/fipsmodule/cipher/e_aria.cc.inc
+  crypto/fipsmodule/cipher/e_lea.cc.inc
+  crypto/fipsmodule/cipher/e_seed.cc.inc
+  crypto/fipsmodule/cipher/e_hight.cc.inc
   crypto/fipsmodule/cmac/cmac.cc.inc
   crypto/fipsmodule/dh/check.cc.inc
   crypto/fipsmodule/dh/dh.cc.inc
@@ -81,7 +90,12 @@ set(
   crypto/fipsmodule/entropy/sha512.cc.inc
   crypto/fipsmodule/hkdf/hkdf.cc.inc
   crypto/fipsmodule/hmac/hmac.cc.inc
+  crypto/fipsmodule/kdf/kbkdf.cc.inc
+  crypto/fipsmodule/rand/drbg90a.cc.inc
+  crypto/fipsmodule/eckcdsa/eckcdsa.cc.inc
+  crypto/fipsmodule/kcdsa/kcdsa.cc.inc
   crypto/fipsmodule/keccak/keccak.cc.inc
+  crypto/fipsmodule/keccak/e_sha3.cc.inc
   crypto/fipsmodule/mldsa/fips_known_values.inc
   crypto/fipsmodule/mldsa/mldsa.cc.inc
   crypto/fipsmodule/mlkem/fips_known_values.inc
@@ -209,6 +223,22 @@ set(
   gen/bcm/x86_64-mont5-linux.S
   third_party/fiat/asm/fiat_p256_adx_mul.S
   third_party/fiat/asm/fiat_p256_adx_sqr.S
+  gen/bcm/aes-gcm-avx2-x86_64-mingw64.S
+  gen/bcm/aes-gcm-avx512-x86_64-mingw64.S
+  gen/bcm/aesni-gcm-x86_64-mingw64.S
+  gen/bcm/aesni-x86_64-mingw64.S
+  gen/bcm/ghash-ssse3-x86_64-mingw64.S
+  gen/bcm/ghash-x86_64-mingw64.S
+  gen/bcm/p256-x86_64-asm-mingw64.S
+  gen/bcm/p256_beeu-x86_64-asm-mingw64.S
+  gen/bcm/rdrand-x86_64-mingw64.S
+  gen/bcm/sha1-x86_64-mingw64.S
+  gen/bcm/sha256-x86_64-mingw64.S
+  gen/bcm/sha512-x86_64-mingw64.S
+  gen/bcm/vpaes-x86_64-mingw64.S
+  gen/bcm/x86_64-mont-mingw64.S
+  gen/bcm/x86_64-mont5-mingw64.S
+  gen/bcm/rsaz-avx2-mingw64.S
 )
 
 set(
@@ -456,6 +486,7 @@ set(
   crypto/rand/ios.cc
   crypto/rand/rand.cc
   crypto/rand/trusty.cc
+  crypto/rand/uefi.cc
   crypto/rand/urandom.cc
   crypto/rand/windows.cc
   crypto/rc4/rc4.cc
@@ -556,6 +587,15 @@ set(
 
   include/openssl/aead.h
   include/openssl/aes.h
+  include/openssl/aria.h
+  include/openssl/lea.h
+  include/openssl/seed.h
+  include/openssl/hight.h
+  include/openssl/lsh.h
+  include/openssl/kbkdf.h
+  include/openssl/drbg_kcmvp.h
+  include/openssl/eckcdsa.h
+  include/openssl/kcdsa.h
   include/openssl/arm_arch.h
   include/openssl/asm_base.h
   include/openssl/asn1.h
@@ -757,6 +797,10 @@ set(
   gen/crypto/md5-x86_64-linux.S
   third_party/fiat/asm/fiat_curve25519_adx_mul.S
   third_party/fiat/asm/fiat_curve25519_adx_square.S
+  gen/crypto/aes128gcmsiv-x86_64-mingw64.S
+  gen/crypto/chacha-x86_64-mingw64.S
+  gen/crypto/chacha20_poly1305_x86_64-mingw64.S
+  gen/crypto/md5-x86_64-mingw64.S
 )
 
 set(

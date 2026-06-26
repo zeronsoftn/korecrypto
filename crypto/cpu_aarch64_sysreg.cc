@@ -19,8 +19,15 @@
 // While Arm system registers are normally not available to userspace, FreeBSD
 // expects userspace to simply read them. It traps the reads and fills in CPU
 // capabilities.
-#if defined(OPENSSL_AARCH64) && !defined(OPENSSL_STATIC_ARMCAP) && \
-    (defined(ANDROID_BAREMETAL) || defined(OPENSSL_FREEBSD)) &&    \
+//
+// KORECRYPTO_BAREMETAL(UEFI 포함): freestanding 환경에는 getauxval 등 OS 의
+// CPU 특성 질의 수단이 없고, 통합자가 EL1/EL2(특권 레벨)에서 구동하므로 ID_AA64*
+// 시스템 레지스터를 MRS 로 직접 읽을 수 있다. 그래서 이 sysreg 경로를 사용한다.
+// (다른 cpu_aarch64_*.cc 는 모두 특정 OS 플랫폼 매크로를 요구해 baremetal 에서는
+//  OPENSSL_cpuid_setup 이 정의되지 않으므로, 여기서 정의를 제공해야 한다.)
+#if defined(OPENSSL_AARCH64) && !defined(OPENSSL_STATIC_ARMCAP) &&  \
+    (defined(ANDROID_BAREMETAL) || defined(OPENSSL_FREEBSD) ||      \
+     defined(KORECRYPTO_BAREMETAL)) &&                              \
     !defined(OPENSSL_NO_ASM)
 
 #include "./armv8_feature_parsing.h"
@@ -63,4 +70,4 @@ void OPENSSL_cpuid_setup() {
 BSSL_NAMESPACE_END
 
 #endif  // OPENSSL_AARCH64 && !OPENSSL_STATIC_ARMCAP &&
-        // (ANDROID_BAREMETAL || OPENSSL_FREEBSD)
+        // (ANDROID_BAREMETAL || OPENSSL_FREEBSD || KORECRYPTO_BAREMETAL)

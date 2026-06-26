@@ -44,6 +44,12 @@ OPENSSL_EXPORT const EVP_MD *EVP_sha512(void);
 OPENSSL_EXPORT const EVP_MD *EVP_sha512_256(void);
 OPENSSL_EXPORT const EVP_MD *EVP_blake2b256(void);
 
+// SHA-3 (FIPS 202), KCMVP validation-target hashes.
+OPENSSL_EXPORT const EVP_MD *EVP_sha3_224(void);
+OPENSSL_EXPORT const EVP_MD *EVP_sha3_256(void);
+OPENSSL_EXPORT const EVP_MD *EVP_sha3_384(void);
+OPENSSL_EXPORT const EVP_MD *EVP_sha3_512(void);
+
 // EVP_md5_sha1 is a TLS-specific `EVP_MD` which computes the concatenation of
 // MD5 and SHA-1, as used in TLS 1.1 and below.
 OPENSSL_EXPORT const EVP_MD *EVP_md5_sha1(void);
@@ -127,7 +133,10 @@ OPENSSL_EXPORT int EVP_DigestUpdate(EVP_MD_CTX *ctx, const void *data,
 
 // EVP_MAX_MD_BLOCK_SIZE is the largest digest block size supported, in
 // bytes.
-#define EVP_MAX_MD_BLOCK_SIZE 128  // SHA-512 is the longest so far.
+// KCMVP: LSH-512 의 메시지 블록은 256바이트로, HMAC 의 pad/key_block 버퍼가
+// 이 값으로 잡힌다. LSH-512(및 SHA3-224/256, 블록 144/136) 기반 HMAC 에서
+// 스택 버퍼 오버플로를 막기 위해 128→256 으로 상향한다.
+#define EVP_MAX_MD_BLOCK_SIZE 256  // LSH-512 block is 256 bytes.
 
 // EVP_DigestFinal_ex finishes the digest in `ctx` and writes the output to
 // `md_out`. `EVP_MD_CTX_size` bytes are written, which is at most
@@ -344,9 +353,10 @@ OPENSSL_EXPORT int EVP_Q_digest(OSSL_LIB_CTX *libctx, const char *name,
 struct evp_md_pctx_ops;
 
 // EVP_MAX_MD_DATA_SIZE is a private constant which specifies the size of the
-// largest digest state. SHA-512 and BLAKE2b are joint-largest. Consuming code
-// only uses this via the `EVP_MD_CTX` type.
-#define EVP_MAX_MD_DATA_SIZE 208
+// largest digest state. LSH-512 is the largest (a 256-byte block buffer plus a
+// 128-byte chaining value); among the others SHA-512 and BLAKE2b are joint-
+// largest. Consuming code only uses this via the `EVP_MD_CTX` type.
+#define EVP_MAX_MD_DATA_SIZE 416
 
 // env_md_ctx_st is typoed ("evp" -> "env"), but the typo comes from OpenSSL
 // and some consumers forward-declare these structures so we're leaving it

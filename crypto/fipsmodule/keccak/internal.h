@@ -25,6 +25,10 @@ enum boringssl_keccak_config_t : int32_t {
   boringssl_sha3_512,
   boringssl_shake128,
   boringssl_shake256,
+  // SHA3-224 and SHA3-384 are added for KCMVP; appended to preserve the
+  // existing enumerator values.
+  boringssl_sha3_224,
+  boringssl_sha3_384,
 };
 
 enum boringssl_keccak_phase_t : int32_t {

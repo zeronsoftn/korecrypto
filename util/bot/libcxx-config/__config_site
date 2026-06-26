@@ -1,7 +1,10 @@
 #ifndef BORINGSSL_LIBCXX_CONFIG_SITE_
 #define BORINGSSL_LIBCXX_CONFIG_SITE_
 
-#if defined(__APPLE__)
+#if defined(__UEFI__)
+// UEFI(freestanding): 병렬 알고리즘 백엔드는 스레드 없는 직렬.
+#define _LIBCPP_PSTL_BACKEND_SERIAL 1
+#elif defined(__APPLE__)
 #define _LIBCPP_PSTL_BACKEND_LIBDISPATCH 1
 #else
 #define _LIBCPP_PSTL_BACKEND_STD_THREAD 1
@@ -22,12 +25,30 @@
 // Randomize order where unspecified (e.g. equal-comparing items in std::sort).
 #define _LIBCPP_DEBUG_RANDOMIZE_UNSPECIFIED_STABILITY
 
+#if !defined(__UEFI__)
 // libc++ headers disable std::string ASan annotations if this is not defined.
 // This is to avoid false positives when libc++'s runtime components are
 // uninstrumented. When building our custom libc++, libc++ will be as
 // instrumented as the caller, so we can safely enable this.
+// (UEFI freestanding 빌드에는 ASan 런타임이 없으므로 비활성한다.)
 #define _LIBCPP_INSTRUMENTED_WITH_ASAN 1
+#endif
 
+#if defined(__UEFI__)
+// UEFI(freestanding): hosted OS 기능이 없으므로 thread/filesystem/locale/
+// monotonic clock/RNG device/wild character/unicode 를 모두 비활성한다.
+#define _LIBCPP_HAS_FILESYSTEM 0
+#define _LIBCPP_HAS_LOCALIZATION 0
+#define _LIBCPP_HAS_MONOTONIC_CLOCK 0
+#define _LIBCPP_HAS_RANDOM_DEVICE 0
+#define _LIBCPP_HAS_THREADS 0
+#define _LIBCPP_HAS_VENDOR_AVAILABILITY_ANNOTATIONS 0
+#define _LIBCPP_HAS_UNICODE 0
+#define _LIBCPP_HAS_WIDE_CHARACTERS 0
+#define _LIBCPP_HAS_THREAD_API_PTHREAD 0
+#define _LIBCPP_HAS_THREAD_API_EXTERNAL 0
+#define _LIBCPP_HAS_THREAD_API_WIN32 0
+#else
 #define _LIBCPP_HAS_FILESYSTEM 1
 #define _LIBCPP_HAS_LOCALIZATION 1
 #define _LIBCPP_HAS_MONOTONIC_CLOCK 1
@@ -46,5 +67,6 @@
 #define _LIBCPP_HAS_THREAD_API_EXTERNAL 0
 #define _LIBCPP_HAS_THREAD_API_WIN32 0
 #endif
+#endif  // __UEFI__
 
 #endif  // BORINGSSL_LIBCXX_CONFIG_SITE_

@@ -16,7 +16,8 @@
 
 #include <openssl/base.h>
 
-#if defined(OPENSSL_LINUX) || defined(OPENSSL_MACOS)
+#if defined(OPENSSL_LINUX) || defined(OPENSSL_MACOS) || \
+    defined(OPENSSL_WINDOWS) || defined(KORECRYPTO_BAREMETAL)
 
 #include <stddef.h>
 #include <stdint.h>
@@ -24,7 +25,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if !defined(KORECRYPTO_BAREMETAL)
+// unistd.h 는 POSIX 전용. bare-metal(예: UEFI x86_64)은 _rdtsc() 만 쓰므로 불필요.
 #include <unistd.h>
+#endif
 
 #include <array>
 #include <type_traits>

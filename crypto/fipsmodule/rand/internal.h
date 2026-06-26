@@ -39,6 +39,14 @@ struct ctr_drbg_state_st {
   uint8_t counter[16];
   uint64_t reseed_counter;
   int df;
+  // KCMVP 일반 블록암호 확장. |generic|==0 이면 위 AES-256 고속경로(기존 RNG·
+  // FIPS 경로)를 그대로 쓴다. |generic|==1 이면 아래 필드로 일반 블록암호
+  // (AES-128/192/256·ARIA·SEED·LEA·HIGHT)를 처리한다.
+  int generic;
+  int kcmvp_cipher;       // CTR_DRBG_KCMVP_* (AES/ARIA/LEA/SEED/HIGHT)
+  size_t kcmvp_keylen;    // bytes
+  size_t kcmvp_blocklen;  // bytes (HIGHT 8, 그 외 16)
+  uint8_t kcmvp_key[32];  // 현재 Key 원본
 };
 
 BSSL_NAMESPACE_BEGIN

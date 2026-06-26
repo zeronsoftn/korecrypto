@@ -102,6 +102,27 @@ OPENSSL_EXPORT int CTR_DRBG_generate(CTR_DRBG_STATE *drbg, uint8_t *out,
 // CTR_DRBG_clear zeroises the state of `drbg`.
 OPENSSL_EXPORT void CTR_DRBG_clear(CTR_DRBG_STATE *drbg);
 
+// --- KCMVP: 구성 가능한 CTR_DRBG (일반 블록암호) ---
+//
+// 기본 CTR_DRBG(위)는 AES-256 고정이다. 아래는 KCMVP 검증대상 시험을 위해
+// 블록암호·키 길이·df 를 구성할 수 있는 변형으로, 같은 CTR_DRBG_STATE 위에서
+// 동작한다(CTR_DRBG_reseed_ex / CTR_DRBG_generate / CTR_DRBG_free 공용).
+
+// 하부 블록암호 종류.
+#define CTR_DRBG_KCMVP_AES 0
+#define CTR_DRBG_KCMVP_ARIA 1
+#define CTR_DRBG_KCMVP_LEA 2
+#define CTR_DRBG_KCMVP_SEED 3
+#define CTR_DRBG_KCMVP_HIGHT 4
+
+// CTR_DRBG_new_ex 는 |cipher|/|keylen|(바이트)/|df| 로 구성 가능한 CTR_DRBG 를
+// 인스턴스화하여 반환한다(SP 800-90A). no-df 일 때 |entropy_len| 은
+// seedlen(=keylen+blocklen) 과 같아야 한다. 실패 시 NULL.
+OPENSSL_EXPORT CTR_DRBG_STATE *CTR_DRBG_new_ex(
+    int cipher, size_t keylen, int df, const uint8_t *entropy,
+    size_t entropy_len, const uint8_t *nonce, size_t nonce_len,
+    const uint8_t *perso, size_t perso_len);
+
 
 #if defined(__cplusplus)
 }  // extern C

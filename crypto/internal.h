@@ -35,8 +35,15 @@
 #include <stdlib.h>
 #endif
 
-#if defined(OPENSSL_THREADS) && \
-    (!defined(OPENSSL_WINDOWS) || defined(__MINGW32__))
+// 윈도우+MinGW 에서는 기본적으로 winpthreads(pthread)를 사용한다. 다만 FIPS
+// 빌드에서는 winpthreads 의 PTHREAD_RWLOCK_INITIALIZER 가 (pthread_rwlock_t)-1
+// 이라 StaticMutex/ExDataClass 같은 정적 전역이 0 이 아닌 .data 로 배치된다.
+// FIPS 모듈은 가변 .data 를 가질 수 없으므로(무결성 해시 대상에서 제외하기 위해
+// 모든 정적 전역이 0 초기화되어 .bss 에 있어야 한다), FIPS 빌드에서는 0 으로
+// 초기화되는 네이티브 SRWLOCK(OPENSSL_WINDOWS_THREADS)을 사용한다.
+#if defined(OPENSSL_THREADS) &&                  \
+    (!defined(OPENSSL_WINDOWS) ||                \
+     (defined(__MINGW32__) && !defined(BORINGSSL_FIPS)))
 #include <pthread.h>
 #define OPENSSL_PTHREADS
 #endif
@@ -53,12 +60,19 @@
 #endif
 
 #if defined(OPENSSL_WINDOWS_THREADS)
+// WIN32_LEAN_AND_MEAN 으로 windows.h 가 옛 winsock.h(v1)를 끌어오지 않게 한다.
+// 그래야 다른 곳에서 winsock2.h 를 나중에 포함해도 충돌하지 않는다(MinGW 는
+// 순서가 틀리면 경고를 내고 -Werror 로 오류가 된다).
+#if !defined(WIN32_LEAN_AND_MEAN)
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #endif
 
-#if defined(_M_X64) || defined(_M_IX86)
-#include "intrin.h"
-#endif
+// windows 에서 __cpuidex, mm3dnow 오류남
+// #if defined(_M_X64) || defined(_M_IX86)
+// #include "intrin.h"
+// #endif
 
 #if defined(BORINGSSL_PREFIX)
 #include <openssl/prefix_symbols_internal_c.h>  // IWYU pragma: export

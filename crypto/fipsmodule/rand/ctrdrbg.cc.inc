@@ -16,7 +16,11 @@
 
 #include <assert.h>
 
+#include <openssl/aria.h>
+#include <openssl/hight.h>
+#include <openssl/lea.h>
 #include <openssl/mem.h>
+#include <openssl/seed.h>
 #include <algorithm>
 
 #include "../../mem_internal.h"
@@ -147,6 +151,320 @@ static int block_cipher_df(uint8_t *out, size_t out_len, const uint8_t *input,
   return 1;
 }
 
+// ===================== KCMVP 일반 블록암호 CTR_DRBG =======================
+//
+// 기본 경로(위)는 AES-256 고정·고속(aes_ctr_set_key/block128_f). 아래는 KCMVP
+// 시험용으로 블록암호·키 길이·df 를 구성 가능한 경로다(drbg->generic==1).
+// 매 블록 키스케줄을 생성하므로(시험 생성기 용도) 단순·정확성 우선.
+
+// kdrbg_block 은 한 블록을 암호화한다.
+static int kdrbg_block(int cipher, const uint8_t *key, size_t keylen,
+                       const uint8_t *in, uint8_t *out) {
+  unsigned bits = (unsigned)(keylen * 8);
+  switch (cipher) {
+    case CTR_DRBG_KCMVP_AES: {
+      AES_KEY k;
+      if (BCM_aes_set_encrypt_key(key, bits, &k) == bcm_status::failure) {
+        return 0;
+      }
+      BCM_aes_encrypt(in, out, &k);
+      return 1;
+    }
+    case CTR_DRBG_KCMVP_ARIA: {
+      ARIA_KEY k;
+      if (ARIA_set_encrypt_key(key, bits, &k) != 0) {
+        return 0;
+      }
+      ARIA_encrypt_block(in, out, &k);
+      return 1;
+    }
+    case CTR_DRBG_KCMVP_LEA: {
+      LEA_KEY k;
+      if (LEA_set_key(key, bits, &k) != 0) {
+        return 0;
+      }
+      LEA_encrypt_block(in, out, &k);
+      return 1;
+    }
+    case CTR_DRBG_KCMVP_SEED: {
+      SEED_KEY k;
+      if (SEED_set_key(key, &k) != 0) {
+        return 0;
+      }
+      SEED_encrypt_block(in, out, &k);
+      return 1;
+    }
+    case CTR_DRBG_KCMVP_HIGHT: {
+      HIGHT_KEY k;
+      if (HIGHT_set_key(key, &k) != 0) {
+        return 0;
+      }
+      HIGHT_encrypt_block(in, out, &k);
+      return 1;
+    }
+  }
+  return 0;
+}
+
+// kdrbg_inc 는 블록 길이 빅엔디안 카운터를 1 증가(전체 블록 캐리).
+static void kdrbg_inc(uint8_t *v, size_t n) {
+  for (size_t i = n; i > 0; i--) {
+    if (++v[i - 1] != 0) {
+      break;
+    }
+  }
+}
+
+// CTR_DRBG_Update(generic): data(==seedlen, 또는 nullptr) 로 (Key,V) 갱신.
+static int ctr_drbg_update_generic(CTR_DRBG_STATE *drbg, const uint8_t *data) {
+  const size_t kl = drbg->kcmvp_keylen, bl = drbg->kcmvp_blocklen, sl = kl + bl;
+  uint8_t temp[48];
+  size_t tlen = 0;
+  while (tlen < sl) {
+    kdrbg_inc(drbg->counter, bl);
+    uint8_t blk[16];
+    if (!kdrbg_block(drbg->kcmvp_cipher, drbg->kcmvp_key, kl, drbg->counter,
+                     blk)) {
+      return 0;
+    }
+    size_t take = sl - tlen < bl ? sl - tlen : bl;
+    OPENSSL_memcpy(temp + tlen, blk, take);
+    tlen += take;
+  }
+  if (data != nullptr) {
+    for (size_t i = 0; i < sl; i++) {
+      temp[i] ^= data[i];
+    }
+  }
+  OPENSSL_memcpy(drbg->kcmvp_key, temp, kl);
+  OPENSSL_memcpy(drbg->counter, temp + kl, bl);
+  return 1;
+}
+
+// kdrbg_bcc: 블록암호 CBC-MAC.
+static int kdrbg_bcc(int cipher, const uint8_t *key, size_t kl, size_t bl,
+                     const uint8_t *data, size_t data_len, uint8_t *out) {
+  OPENSSL_memset(out, 0, bl);
+  for (size_t off = 0; off < data_len; off += bl) {
+    uint8_t in[16];
+    for (size_t i = 0; i < bl; i++) {
+      in[i] = out[i] ^ data[off + i];
+    }
+    if (!kdrbg_block(cipher, key, kl, in, out)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+// kdrbg_df: SP 800-90A 10.3.2 블록암호 유도함수(generic).
+static int kdrbg_df(int cipher, size_t kl, size_t bl, const uint8_t *input,
+                    size_t input_len, uint8_t *out, size_t out_len) {
+  const size_t s_unpadded = 8 + input_len + 1;
+  const size_t s_len = ((s_unpadded + bl - 1) / bl) * bl;
+  uint8_t *S = reinterpret_cast<uint8_t *>(OPENSSL_malloc(s_len));
+  uint8_t *buf = reinterpret_cast<uint8_t *>(OPENSSL_malloc(bl + s_len));
+  int ret = 0;
+  if (S == nullptr || buf == nullptr) {
+    goto done;
+  }
+  OPENSSL_memset(S, 0, s_len);
+  CRYPTO_store_u32_be(S, (uint32_t)input_len);
+  CRYPTO_store_u32_be(S + 4, (uint32_t)out_len);
+  if (input_len > 0) {
+    OPENSSL_memcpy(S + 8, input, input_len);
+  }
+  S[8 + input_len] = 0x80;
+  {
+    uint8_t dfkey[32];
+    for (size_t i = 0; i < kl; i++) {
+      dfkey[i] = (uint8_t)i;
+    }
+    uint8_t temp[48];
+    size_t tlen = 0;
+    uint32_t i = 0;
+    while (tlen < kl + bl) {
+      OPENSSL_memset(buf, 0, bl);
+      CRYPTO_store_u32_be(buf, i);
+      OPENSSL_memcpy(buf + bl, S, s_len);
+      uint8_t mac[16];
+      if (!kdrbg_bcc(cipher, dfkey, kl, bl, buf, bl + s_len, mac)) {
+        goto done;
+      }
+      size_t take = (kl + bl - tlen < bl) ? (kl + bl - tlen) : bl;
+      OPENSSL_memcpy(temp + tlen, mac, take);
+      tlen += take;
+      i++;
+    }
+    uint8_t K[32], X[16];
+    OPENSSL_memcpy(K, temp, kl);
+    OPENSSL_memcpy(X, temp + kl, bl);
+    size_t done_len = 0;
+    while (done_len < out_len) {
+      uint8_t tmp[16];
+      if (!kdrbg_block(cipher, K, kl, X, tmp)) {
+        goto done;
+      }
+      OPENSSL_memcpy(X, tmp, bl);
+      size_t take = (out_len - done_len < bl) ? (out_len - done_len) : bl;
+      OPENSSL_memcpy(out + done_len, X, take);
+      done_len += take;
+    }
+    ret = 1;
+  }
+done:
+  if (S != nullptr) {
+    OPENSSL_free(S);
+  }
+  if (buf != nullptr) {
+    OPENSSL_free(buf);
+  }
+  return ret;
+}
+
+static int ctr_drbg_reseed_generic(CTR_DRBG_STATE *drbg, const uint8_t *entropy,
+                                   size_t entropy_len, const uint8_t *addtl,
+                                   size_t addtl_len) {
+  const size_t bl = drbg->kcmvp_blocklen, sl = drbg->kcmvp_keylen + bl;
+  uint8_t seed[48];
+  if (drbg->df) {
+    size_t ml = entropy_len + addtl_len;
+    uint8_t *m = reinterpret_cast<uint8_t *>(OPENSSL_malloc(ml ? ml : 1));
+    if (m == nullptr) {
+      return 0;
+    }
+    OPENSSL_memcpy(m, entropy, entropy_len);
+    if (addtl_len) {
+      OPENSSL_memcpy(m + entropy_len, addtl, addtl_len);
+    }
+    int ok = kdrbg_df(drbg->kcmvp_cipher, drbg->kcmvp_keylen, bl, m, ml, seed,
+                      sl);
+    OPENSSL_free(m);
+    if (!ok) {
+      return 0;
+    }
+  } else {
+    if (entropy_len != sl) {
+      return 0;
+    }
+    OPENSSL_memcpy(seed, entropy, sl);
+    for (size_t i = 0; i < addtl_len && i < sl; i++) {
+      seed[i] ^= addtl[i];
+    }
+  }
+  int ok = ctr_drbg_update_generic(drbg, seed);
+  OPENSSL_cleanse(seed, sizeof(seed));
+  drbg->reseed_counter = 1;
+  return ok;
+}
+
+static int ctr_drbg_generate_generic(CTR_DRBG_STATE *drbg, uint8_t *out,
+                                     size_t out_len, const uint8_t *addtl,
+                                     size_t addtl_len) {
+  const size_t bl = drbg->kcmvp_blocklen, sl = drbg->kcmvp_keylen + bl;
+  uint8_t add[48];
+  int have_add = 0;
+  if (addtl != nullptr && addtl_len > 0) {
+    have_add = 1;
+    if (drbg->df) {
+      if (!kdrbg_df(drbg->kcmvp_cipher, drbg->kcmvp_keylen, bl, addtl, addtl_len,
+                    add, sl)) {
+        return 0;
+      }
+    } else {
+      OPENSSL_memset(add, 0, sl);
+      for (size_t i = 0; i < addtl_len && i < sl; i++) {
+        add[i] = addtl[i];
+      }
+    }
+    if (!ctr_drbg_update_generic(drbg, add)) {
+      return 0;
+    }
+  }
+  size_t done = 0;
+  while (done < out_len) {
+    kdrbg_inc(drbg->counter, bl);
+    uint8_t blk[16];
+    if (!kdrbg_block(drbg->kcmvp_cipher, drbg->kcmvp_key, drbg->kcmvp_keylen,
+                     drbg->counter, blk)) {
+      return 0;
+    }
+    size_t take = out_len - done < bl ? out_len - done : bl;
+    OPENSSL_memcpy(out + done, blk, take);
+    done += take;
+  }
+  int ok = ctr_drbg_update_generic(drbg, have_add ? add : nullptr);
+  OPENSSL_cleanse(add, sizeof(add));
+  drbg->reseed_counter++;
+  return ok;
+}
+
+CTR_DRBG_STATE *CTR_DRBG_new_ex(int cipher, size_t keylen, int df,
+                                const uint8_t *entropy, size_t entropy_len,
+                                const uint8_t *nonce, size_t nonce_len,
+                                const uint8_t *perso, size_t perso_len) {
+  CTR_DRBG_STATE *drbg = New<CTR_DRBG_STATE>();
+  if (drbg == nullptr) {
+    return nullptr;
+  }
+  drbg->generic = 1;
+  drbg->kcmvp_cipher = cipher;
+  drbg->kcmvp_keylen = keylen;
+  drbg->kcmvp_blocklen = (cipher == CTR_DRBG_KCMVP_HIGHT) ? 8 : 16;
+  drbg->df = df;
+  const size_t bl = drbg->kcmvp_blocklen, sl = keylen + bl;
+  if (keylen > 32 || sl > 48) {
+    CTR_DRBG_free(drbg);
+    return nullptr;
+  }
+  OPENSSL_memset(drbg->kcmvp_key, 0, sizeof(drbg->kcmvp_key));
+  OPENSSL_memset(drbg->counter, 0, sizeof(drbg->counter));
+
+  uint8_t seed[48];
+  int ok;
+  if (df) {
+    size_t ml = entropy_len + nonce_len + perso_len;
+    uint8_t *m = reinterpret_cast<uint8_t *>(OPENSSL_malloc(ml ? ml : 1));
+    if (m == nullptr) {
+      CTR_DRBG_free(drbg);
+      return nullptr;
+    }
+    size_t o = 0;
+    OPENSSL_memcpy(m + o, entropy, entropy_len);
+    o += entropy_len;
+    if (nonce_len) {
+      OPENSSL_memcpy(m + o, nonce, nonce_len);
+      o += nonce_len;
+    }
+    if (perso_len) {
+      OPENSSL_memcpy(m + o, perso, perso_len);
+    }
+    ok = kdrbg_df(cipher, keylen, bl, m, ml, seed, sl);
+    OPENSSL_free(m);
+  } else {
+    if (entropy_len + nonce_len != sl) {
+      CTR_DRBG_free(drbg);
+      return nullptr;
+    }
+    OPENSSL_memcpy(seed, entropy, entropy_len);
+    if (nonce_len) {
+      OPENSSL_memcpy(seed + entropy_len, nonce, nonce_len);
+    }
+    for (size_t i = 0; i < perso_len && i < sl; i++) {
+      seed[i] ^= perso[i];
+    }
+    ok = 1;
+  }
+  if (!ok || !ctr_drbg_update_generic(drbg, seed)) {
+    OPENSSL_cleanse(seed, sizeof(seed));
+    CTR_DRBG_free(drbg);
+    return nullptr;
+  }
+  OPENSSL_cleanse(seed, sizeof(seed));
+  drbg->reseed_counter = 1;
+  return drbg;
+}
+
 CTR_DRBG_STATE *CTR_DRBG_new(const uint8_t entropy[CTR_DRBG_ENTROPY_LEN],
                              const uint8_t *personalization,
                              size_t personalization_len) {
@@ -230,6 +548,7 @@ int bssl::CTR_DRBG_init(CTR_DRBG_STATE *drbg, int df, const uint8_t *entropy,
   }
 
   drbg->df = df;
+  drbg->generic = 0;  // AES-256 고속경로.
   drbg->ctr =
       aes_ctr_set_key(&drbg->ks, nullptr, &drbg->block, seed_material, 32);
   OPENSSL_memcpy(drbg->counter, seed_material + 32, 16);
@@ -277,6 +596,10 @@ int CTR_DRBG_reseed(CTR_DRBG_STATE *drbg,
 int CTR_DRBG_reseed_ex(CTR_DRBG_STATE *drbg, const uint8_t *entropy,
                        size_t entropy_len, const uint8_t *additional_data,
                        size_t additional_data_len) {
+  if (drbg->generic) {
+    return ctr_drbg_reseed_generic(drbg, entropy, entropy_len, additional_data,
+                                   additional_data_len);
+  }
   if (additional_data_len > CTR_DRBG_SEED_LEN ||
       (drbg->df && (entropy_len > CTR_DRBG_MAX_ENTROPY_LEN ||
                     entropy_len < CTR_DRBG_MIN_ENTROPY_LEN)) ||
@@ -324,6 +647,11 @@ int CTR_DRBG_generate(CTR_DRBG_STATE *drbg, uint8_t *out, size_t out_len,
   // See 9.3.1
   if (out_len > CTR_DRBG_MAX_GENERATE_LENGTH) {
     return 0;
+  }
+
+  if (drbg->generic) {
+    return ctr_drbg_generate_generic(drbg, out, out_len, additional_data,
+                                     additional_data_len);
   }
 
   // See 10.2.1.5.1

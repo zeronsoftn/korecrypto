@@ -18,7 +18,6 @@ package main
 
 import (
 	"bytes"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -30,7 +29,6 @@ import (
 	"strings"
 
 	"boringssl.googlesource.com/boringssl.git/util/ar"
-	"boringssl.googlesource.com/boringssl.git/util/fipstools/fipscommon"
 )
 
 // inputFile represents a textual assembly file.
@@ -60,9 +58,21 @@ const (
 	aarch64
 )
 
+// objectFormat 는 입력 어셈블리의 오브젝트 파일 형식을 나타낸다. 형식에 따라
+// 섹션/재배치 처리와 모듈 출력 방식이 달라진다.
+type objectFormat int
+
+const (
+	// objectFormatELF 는 ELF/Mach-O (리눅스/macOS) 형식이다.
+	objectFormatELF objectFormat = iota
+	// objectFormatCOFF 는 COFF/PE (윈도우, x86_64-w64-windows-gnu) 형식이다.
+	objectFormatCOFF
+)
+
 // delocation holds the state needed during a delocation operation.
 type delocation struct {
 	processor processorType
+	format    objectFormat
 	output    stringWriter
 	// commentIndicator starts a comment, e.g. "//" or "#"
 	commentIndicator string
@@ -88,6 +98,17 @@ type delocation struct {
 	gotOffsetsNeeded map[string]struct{}
 	// gotOffOffsetsNeeded contains the symbols whose @GOTOFF offsets are needed.
 	gotOffOffsetsNeeded map[string]struct{}
+
+	// coffExternalPtrs is the set of external symbols (COFF 전용) whose 주소를
+	// 모듈 밖 포인터(bcm_external_<sym>: .quad <sym>)를 통해 로드해야 하는
+	// 경우의 집합이다. `leaq <external>(%rip)` 형태를 대체할 때 사용된다.
+	coffExternalPtrs map[string]struct{}
+
+	// coffSymbolRenames maps original symbol names to their per-file-unique
+	// names (COFF 전용). 예: "se_handler" -> "vpaes_se_handler" (vpaes-x86_64.pl
+	// 파일에서), "mul_handler" -> "mont_mul_handler" (x86_64-mont.pl).
+	// perlasm이 생성하는 중복 가능한 심볼(SEH 핸들러 등)을 파일별로 개명한다.
+	coffSymbolRenames map[string]string
 
 	currentInput inputFile
 }
@@ -140,11 +161,46 @@ func (d *delocation) processInput(input inputFile) (err error) {
 			continue
 		}
 
+		// COFF 형식에서 .def 지시자의 심볼을 개명한다.
+		if d.format == objectFormatCOFF {
+			line := d.contents(statement)
+			if strings.HasPrefix(strings.TrimSpace(line), ".def") {
+				// .def 지시자: ".def <symbol>; ..." 형식
+				parts := strings.SplitN(line, ";", 2)
+				if len(parts) >= 1 {
+					defPart := strings.TrimSpace(parts[0])
+					fields := strings.Fields(defPart)
+					if len(fields) >= 2 {
+						original := fields[1]
+						renamed := d.mapCOFFSymbol(original)
+						// AArch64 COFF 의 바레 'L' 로컬 라벨은 라벨/참조와 동일하게
+						// 파일별로 개명해야 한다(그렇지 않으면 .def 가 정의되지 않은
+						// 원본 이름을 선언해 미정의 심볼이 된다).
+						if renamed == original && d.isAarch64LocalLabel(original) {
+							renamed = d.mapLocalSymbol(original)
+						}
+						if renamed != original {
+							// 개명된 이름으로 출력.
+							newLine := strings.Replace(line, ".def\t"+original, ".def\t"+renamed, 1)
+							newLine = strings.Replace(newLine, ".def "+original, ".def "+renamed, 1)
+							d.writeCommentedNode(statement)
+							d.output.WriteString(newLine)
+							continue
+						}
+					}
+				}
+			}
+		}
+
 		switch node.pegRule {
 		case ruleGlobalDirective, ruleComment, ruleLocationDirective:
 			d.writeNode(statement)
 		case ruleDirective:
-			statement, err = d.processDirective(statement, node.up)
+			if d.format == objectFormatCOFF {
+				statement, err = d.processDirectiveCOFF(statement, node.up)
+			} else {
+				statement, err = d.processDirective(statement, node.up)
+			}
 		case ruleLabelContainingDirective:
 			statement, err = d.processLabelContainingDirective(statement, node.up)
 		case rulePrefAlignDirective:
@@ -156,8 +212,16 @@ func (d *delocation) processInput(input inputFile) (err error) {
 		case ruleInstruction:
 			switch d.processor {
 			case x86_64:
-				statement, err = d.processIntelInstruction(statement, node.up)
+				if d.format == objectFormatCOFF {
+					statement, err = d.processCOFFInstruction(statement, node.up)
+				} else {
+					statement, err = d.processIntelInstruction(statement, node.up)
+				}
 			case aarch64:
+				// aarch64 의 명령어 처리(심볼→로컬타깃, 외부분기→redirector,
+				// adrp/:lo12: 로컬 주소적재, GOT 보조함수)는 오브젝트 형식과
+				// 무관하다. ELF/COFF 모두 동일한 처리기를 쓰고, 형식별 차이는
+				// 모듈 프레이밍(섹션 평탄화·마커·tail)에서만 다룬다.
 				statement, err = d.processAarch64Instruction(statement, node.up)
 			default:
 				panic("unknown processor")
@@ -172,135 +236,6 @@ func (d *delocation) processInput(input inputFile) (err error) {
 	}
 
 	return nil
-}
-
-func (d *delocation) processDirective(statement, directive *node32) (*node32, error) {
-	assertNodeType(directive, ruleDirectiveName)
-	directiveName := d.contents(directive)
-
-	var args []string
-	forEachPath(directive, func(arg *node32) {
-		// If the argument is a quoted string, use the raw contents.
-		// (Note that this doesn't unescape the string, but that's not
-		// needed so far.
-		if arg.up != nil {
-			arg = arg.up
-			assertNodeType(arg, ruleQuotedArg)
-			if arg.up == nil {
-				args = append(args, "")
-				return
-			}
-			arg = arg.up
-			assertNodeType(arg, ruleQuotedText)
-		}
-		args = append(args, d.contents(arg))
-	}, ruleArgs, ruleArg)
-
-	switch directiveName {
-	case "addrsig", "addrsig_sym":
-		// Remove .addrsig and .addrsig_sym tables.
-		// Instead, consider all symbols inside the BCM address-significant
-		// so the linker will not merge them with other symbols,
-		// potentially breaking the integrity check of the BCM.
-		d.writeCommentedNode(statement)
-		break
-
-	case "comm", "lcomm":
-		if len(args) < 1 {
-			return nil, errors.New("comm directive has no arguments")
-		}
-		d.bssAccessorsNeeded[args[0]] = args[0]
-		d.writeNode(statement)
-
-	case "data":
-		// ASAN and some versions of MSAN are adding a .data section,
-		// and adding references to symbols within it to the code. We
-		// will have to work around this in the future.
-		return nil, errors.New(".data section found in module")
-
-	case "bss":
-		d.writeNode(statement)
-		return d.handleBSS(statement)
-
-	case "section":
-		section := args[0]
-
-		if section == ".data.rel.ro" {
-			// In a normal build, this is an indication of a
-			// problem but any references from the module to this
-			// section will result in a relocation and thus will
-			// break the integrity check. ASAN can generate these
-			// sections and so we will likely have to work around
-			// that in the future.
-			return nil, errors.New(".data.rel.ro section found in module")
-		}
-
-		sectionType, ok := sectionType(section)
-		if !ok {
-			// Unknown sections are permitted in order to be robust
-			// to different compiler modes.
-			d.writeNode(statement)
-			break
-		}
-
-		switch sectionType {
-		case ".rodata", ".text":
-			// Move .rodata to .text so it may be accessed without
-			// a relocation. GCC with -fmerge-constants will place
-			// strings into separate sections, so we move all
-			// sections named like .rodata. Also move .text.startup
-			// so the self-test function is also in the module.
-			d.writeCommentedNode(statement)
-			d.output.WriteString(".text\n")
-
-		case ".data":
-			// See above about .data
-			return nil, errors.New(".data section found in module")
-
-		case ".init_array", ".fini_array", ".ctors", ".dtors":
-			// init_array/ctors/dtors contains function
-			// pointers to constructor/destructor
-			// functions. These contain relocations, but
-			// they're in a different section anyway.
-			d.writeNode(statement)
-			break
-
-		case ".debug", ".note":
-			d.writeNode(statement)
-			break
-
-		case ".bss":
-			d.writeNode(statement)
-			return d.handleBSS(statement)
-
-		case ".llvm_addrsig":
-			// Remove .llvm_addrsig sections.
-			// Instead, consider all symbols inside the BCM address-significant
-			// so the linker will not merge them with other symbols,
-			// potentially breaking the integrity check of the BCM.
-			d.writeCommentedNode(statement)
-			d.output.WriteString(".section .discard_llvm_addrsig, \"e\", @progbits\n")
-		}
-
-	case "reloc":
-		// The .reloc directive is used to emit custom relocations into the object
-		// file. R_AARCH64_PATCHINST is a special relocation type used to implement
-		// deactivation symbols, which are associated with LLVM's pointer field
-		// protection feature. Because deactivation symbols are only defined in
-		// special cases which don't apply to BoringSSL, we pass them through and
-		// let the integrity check fail in the unexpected case that a symbol was
-		// defined.
-		if args[1] != "R_AARCH64_PATCHINST" {
-			return nil, errors.New("unexpected .reloc directive")
-		}
-		args[0] = d.mapLocalSymbol(args[0])
-		d.output.WriteString(".reloc " + strings.Join(args, ", ") + "\n")
-
-	default:
-		d.writeNode(statement)
-	}
-
-	return statement, nil
 }
 
 func (d *delocation) processSymbolExpr(expr *node32, b *strings.Builder) bool {
@@ -473,8 +408,26 @@ func (d *delocation) processLabel(statement, label *node32) (*node32, error) {
 		// different .s inputs don't collide.
 		d.output.WriteString(d.mapLocalSymbol(symbol) + ":\n")
 	case ruleSymbolName:
-		d.output.WriteString(localTargetName(symbol) + ":\n")
-		d.writeNode(statement)
+		// AArch64 COFF 의 바레 'L' 로컬 라벨은 파일별 로컬 심볼로 매핑한다(.L 과 동일
+		// 취급). 전역 라벨이 아니므로 localTargetName/원본 라벨을 내지 않는다.
+		if d.isAarch64LocalLabel(symbol) {
+			d.output.WriteString(d.mapLocalSymbol(symbol) + ":\n")
+			return statement, nil
+		}
+		// COFF 형식에서는 중복 가능한 심볼(예: SEH 핸들러)을 파일별로 개명한다.
+		mapped := symbol
+		if d.format == objectFormatCOFF {
+			mapped = d.mapCOFFSymbol(symbol)
+		}
+		// mapped 이름이 원본과 다르면 원본을 주석 처리하고 mapped 라벨을 사용.
+		if mapped != symbol {
+			d.writeCommentedNode(statement)
+			d.output.WriteString(mapped + ":\n")
+			d.output.WriteString(localTargetName(mapped) + ":\n")
+		} else {
+			d.output.WriteString(localTargetName(mapped) + ":\n")
+			d.writeNode(statement)
+		}
 	default:
 		return nil, fmt.Errorf("unknown label type %q", rul3s[label.pegRule])
 	}
@@ -490,301 +443,6 @@ func instructionArgs(node *node32) (argNodes []*node32) {
 	}
 
 	return argNodes
-}
-
-// Aarch64 support
-
-// gotHelperName returns the name of a synthesised function that returns an
-// address from the GOT.
-func gotHelperName(symbol string) string {
-	return ".Lboringssl_loadgot_" + symbol
-}
-
-// loadAarch64Address emits instructions to put the address of |symbol|
-// (optionally adjusted by |offsetStr|) into |targetReg|.
-func (d *delocation) loadAarch64Address(statement *node32, targetReg string, symbol string, offsetStr string) (*node32, error) {
-	// There are two paths here: either the symbol is known to be local in which
-	// case the address is simply loaded, or a GOT reference is really needed in
-	// which case the code needs to jump to a helper function.
-	//
-	// A helper function is needed because using code appears to be the only way
-	// to load a GOT value. On other platforms we have ".quad foo@GOT" outside of
-	// the module, but on Aarch64 that results in a "COPY" relocation and linker
-	// comments suggest it's a weird hack. So, for each GOT symbol needed, we emit
-	// a function outside of the module that returns the address from the GOT in
-	// x0.
-
-	d.writeCommentedNode(statement)
-
-	_, isKnown := d.symbols[symbol]
-	isLocal := strings.HasPrefix(symbol, ".L")
-	if isKnown || isLocal || isSynthesized(symbol) {
-		if isLocal {
-			symbol = d.mapLocalSymbol(symbol)
-		} else if isKnown {
-			symbol = localTargetName(symbol)
-		}
-
-		// Note the adrp instruction always emits a relocation, at least in
-		// clang's assembler. Even when the symbol is defined in the same file,
-		// the assembler cannot compute the adrp offset without knowing the PC's
-		// page offset. We page-align the module, making this offset fixed and
-		// the relocation safe. It will always produce the same offset.
-		fmt.Fprintf(d.output, "\tadrp %s, %s%s\n", targetReg, symbol, offsetStr)
-		fmt.Fprintf(d.output, "\tadd %s, %s, :lo12:%s%s\n", targetReg, targetReg, symbol, offsetStr)
-		return statement, nil
-	}
-
-	if offsetStr != "" {
-		panic("non-zero offset for helper-based reference")
-	}
-
-	// GOT helpers also dereference the GOT entry, thus the subsequent ldr
-	// instruction, which would normally do the dereferencing, needs to be
-	// dropped. GOT helpers have to include the dereference because the
-	// assembler doesn't support ":got_lo12:foo" offsets except in an ldr
-	// instruction.
-	d.gotExternalsNeeded[symbol] = struct{}{}
-	helperFunc := gotHelperName(symbol)
-
-	// Clear the red-zone. I can't find a definitive answer about whether Linux
-	// Aarch64 includes a red-zone, but Microsoft has a 16-byte one and Apple a
-	// 128-byte one. Thus conservatively clear a 128-byte red-zone.
-	d.output.WriteString("\tsub sp, sp, 128\n")
-
-	// Save x0 (which will be stomped by the return value) and the link register
-	// to the stack. Then save the program counter into the link register and
-	// jump to the helper function.
-	d.output.WriteString("\tstp x0, lr, [sp, #-16]!\n")
-	d.output.WriteString("\tbl " + helperFunc + "\n")
-
-	if targetReg == "x0" {
-		// If the target happens to be x0 then restore the link register from the
-		// stack and send the saved value of x0 to the zero register.
-		d.output.WriteString("\tldp xzr, lr, [sp], #16\n")
-	} else {
-		// Otherwise move the result into place and restore registers.
-		d.output.WriteString("\tmov " + targetReg + ", x0\n")
-		d.output.WriteString("\tldp x0, lr, [sp], #16\n")
-	}
-
-	// Revert the red-zone adjustment.
-	d.output.WriteString("\tadd sp, sp, 128\n")
-
-	return statement, nil
-}
-
-func (d *delocation) processAarch64Instruction(statement, instruction *node32) (*node32, error) {
-	assertNodeType(instruction, ruleInstructionName)
-	instructionName := d.contents(instruction)
-
-	argNodes := instructionArgs(instruction.next)
-
-	switch instructionName {
-	case "ccmn", "ccmp", "cinc", "cinv", "cneg", "csel", "cset", "csetm", "csinc", "csinv", "csneg":
-		// These functions are special because they take a condition-code name as
-		// an argument and that looks like a symbol reference.
-		d.writeNode(statement)
-		return statement, nil
-
-	case "mrs":
-		// Functions that take special register names also look like a symbol
-		// reference to the parser.
-		d.writeNode(statement)
-		return statement, nil
-
-	case "adrp":
-		// adrp instructions are turned into either adrp/add pairs or calls to
-		// helper functions, both of which load the full address. Later instructions,
-		// which add the low 12 bits of offset, are tweaked to remove the offset since
-		// it's already included. Loads of GOT symbols are slightly more complex
-		// because it's not possible to avoid dereferencing a GOT entry with Clang's
-		// assembler. Thus the later ldr instruction, which would normally do the
-		// dereferencing, is dropped completely. (Or turned into a mov if it targets
-		// a different register.)
-		//
-		// TODO(davidben): When loading a local symbol, there is no real need to
-		// apply low 12 bits immediately. We could instead preserve the compiler's
-		// choice of (slightly optimized) output by just converting the instructions
-		// one-to-one.
-		assertNodeType(argNodes[0], ruleRegisterOrConstant)
-		targetReg := d.contents(argNodes[0])
-		if !strings.HasPrefix(targetReg, "x") {
-			panic("adrp targeting register " + targetReg + ", which has the wrong size")
-		}
-
-		var symbol, offset string
-		switch argNodes[1].pegRule {
-		case ruleGOTSymbolOffset:
-			symbol = d.contents(argNodes[1].up)
-		case ruleMemoryRef:
-			assertNodeType(argNodes[1].up, ruleSymbolRef)
-			node, empty := d.gatherOffsets(argNodes[1].up.up, "")
-			if empty != "" {
-				panic("prefix offsets found for adrp")
-			}
-			symbol = d.contents(node)
-			_, offset = d.gatherOffsets(node.next, "")
-		default:
-			panic("Unhandled adrp argument type " + rul3s[argNodes[1].pegRule])
-		}
-
-		return d.loadAarch64Address(statement, targetReg, symbol, offset)
-	}
-
-	var args []string
-	changed := false
-
-	for _, arg := range argNodes {
-		fullArg := arg
-
-		switch arg.pegRule {
-		case ruleRegisterOrConstant, ruleLocalLabelRef, ruleARMConstantTweak:
-			args = append(args, d.contents(fullArg))
-
-		case ruleGOTSymbolOffset:
-			// These should only be arguments to adrp and thus unreachable.
-			panic("unreachable")
-
-		case ruleMemoryRef:
-			ref := arg.up
-
-			switch ref.pegRule {
-			case ruleSymbolRef:
-				// This is a branch. Either the target needs to be written to a local
-				// version of the symbol to ensure that no relocations are emitted, or
-				// it needs to jump to a redirector function.
-				symbol, offset, _, didChange, symbolIsLocal, _ := d.parseMemRef(arg.up)
-				changed = didChange
-
-				if _, knownSymbol := d.symbols[symbol]; knownSymbol {
-					symbol = localTargetName(symbol)
-					changed = true
-				} else if !symbolIsLocal && !isSynthesized(symbol) {
-					redirector := redirectorName(symbol)
-					d.redirectors[symbol] = redirector
-					symbol = redirector
-					changed = true
-				} else if didChange && symbolIsLocal && len(offset) > 0 {
-					// didChange is set when the inputFile index is not 0; which is the index of the
-					// first file copied to the output, which is the generated assembly of bcm.c.
-					// In subsequently copied assembly files, local symbols are changed by appending (BCM_ + index)
-					// in order to ensure they don't collide. `index` gets incremented per file.
-					// If there is offset after the symbol, append the `offset`.
-					symbol = symbol + offset
-				}
-
-				args = append(args, symbol)
-
-			case ruleARMBaseIndexScale:
-				parts := ref.up
-				assertNodeType(parts, ruleARMRegister)
-				baseAddrReg := d.contents(parts)
-				parts = skipWS(parts.next)
-
-				// Only two forms need special handling. First there's memory references
-				// like "[x*, :got_lo12:foo]". The base register here will have been the
-				// target of an adrp instruction to load the page address, but the adrp
-				// will have turned into loading the full address *and dereferencing it*,
-				// above. Thus this instruction needs to be dropped otherwise we'll be
-				// dereferencing twice.
-				//
-				// Second there are forms like "[x*, :lo12:foo]" where the code has used
-				// adrp to load the page address into x*. That adrp will have been turned
-				// into loading the full address so just the offset needs to be dropped.
-
-				if parts != nil {
-					if parts.pegRule == ruleARMGOTLow12 {
-						if instructionName != "ldr" {
-							panic("Symbol reference outside of ldr instruction")
-						}
-
-						if skipWS(parts.next) != nil || parts.up.next != nil {
-							panic("can't handle tweak or post-increment with symbol references")
-						}
-
-						// The GOT helper already dereferenced the entry so, at most, just a mov
-						// is needed to put things in the right register.
-						d.writeCommentedNode(statement)
-						if baseAddrReg != args[0] {
-							d.output.WriteString("\tmov " + args[0] + ", " + baseAddrReg + "\n")
-						}
-						return statement, nil
-					} else if parts.pegRule == ruleLow12BitsSymbolRef {
-						switch instructionName {
-						case "ldr", "ldrh", "ldrb", "ldrsw", "ldrsh", "ldrsb":
-						default:
-							panic("Symbol reference outside of load instruction")
-						}
-
-						// Suppress the offset; adrp loaded the full address. This assumes the
-						// the compiler does not emit code like the following:
-						//
-						//   adrp x0, symbol
-						//   ldr x1, [x0, :lo12:symbol]
-						//   ldr x2, [x0, :lo12:symbol+4]
-						//
-						// Such code would only work if lo12(symbol+4) = lo12(symbol) + 4, but
-						// this is true when symbol is sufficiently aligned.
-						args = append(args, "["+baseAddrReg+"]")
-						changed = true
-						continue
-					}
-				}
-
-				args = append(args, d.contents(fullArg))
-
-			case ruleLow12BitsSymbolRef:
-				// These are the second instruction in a pair:
-				//   adrp x0, symbol           // Load the page address into x0
-				//   add x1, x0, :lo12:symbol  // Adds the page offset.
-				//
-				// The adrp instruction will have been turned into a sequence that loads
-				// the full address, above, thus the offset is turned into zero. If that
-				// results in the instruction being a nop, then it is deleted.
-				//
-				// This assumes the compiler does not emit code like the following:
-				//
-				//   adrp x0, symbol
-				//   add x1, x0, :lo12:symbol
-				//   add x2, x0, :lo12:symbol+4
-				//
-				// Such code would only work if lo12(symbol+4) = lo12(symbol) + 4, but
-				// this is true when symbol is sufficiently aligned.
-				if instructionName != "add" {
-					panic(fmt.Sprintf("unsure how to handle %q instruction using lo12", instructionName))
-				}
-
-				if !strings.HasPrefix(args[0], "x") || !strings.HasPrefix(args[1], "x") {
-					panic("address arithmetic with incorrectly sized register")
-				}
-
-				if args[0] == args[1] {
-					d.writeCommentedNode(statement)
-					return statement, nil
-				}
-
-				args = append(args, "#0")
-				changed = true
-
-			default:
-				panic(fmt.Sprintf("unhandled MemoryRef type %s", rul3s[ref.pegRule]))
-			}
-
-		default:
-			panic(fmt.Sprintf("unknown instruction argument type %q", rul3s[arg.pegRule]))
-		}
-	}
-
-	if changed {
-		d.writeCommentedNode(statement)
-		replacement := "\t" + instructionName + "\t" + strings.Join(args, ", ") + "\n"
-		d.output.WriteString(replacement)
-	} else {
-		d.writeNode(statement)
-	}
-
-	return statement, nil
 }
 
 func (d *delocation) gatherOffsets(symRef *node32, offsets string) (*node32, string) {
@@ -933,24 +591,6 @@ func compare(w stringWriter, instr, a, b string) wrapperFunc {
 	}
 }
 
-func (d *delocation) loadFromGOT(w stringWriter, destination, symbol, section string, redzoneCleared bool) wrapperFunc {
-	d.gotExternalsNeeded[symbol+"@"+section] = struct{}{}
-
-	return func(k func()) {
-		if !redzoneCleared {
-			w.WriteString("\tleaq -128(%rsp), %rsp\n") // Clear the red zone.
-		}
-		w.WriteString("\tpushf\n")
-		w.WriteString(fmt.Sprintf("\tleaq %s_%s_external(%%rip), %s\n", symbol, section, destination))
-		w.WriteString(fmt.Sprintf("\taddq (%s), %s\n", destination, destination))
-		w.WriteString(fmt.Sprintf("\tmovq (%s), %s\n", destination, destination))
-		w.WriteString("\tpopf\n")
-		if !redzoneCleared {
-			w.WriteString("\tleaq\t128(%rsp), %rsp\n")
-		}
-	}
-}
-
 func saveFlags(w stringWriter, redzoneCleared bool) wrapperFunc {
 	return func(k func()) {
 		if !redzoneCleared {
@@ -1063,317 +703,6 @@ func (d *delocation) isRIPRelative(node *node32) bool {
 	return node != nil && node.pegRule == ruleBaseIndexScale && d.contents(node) == "(%rip)"
 }
 
-func (d *delocation) processIntelInstruction(statement, instruction *node32) (*node32, error) {
-	var prefix string
-	if instruction.pegRule == ruleInstructionPrefix {
-		prefix = d.contents(instruction)
-		instruction = skipWS(instruction.next)
-	}
-
-	assertNodeType(instruction, ruleInstructionName)
-	instructionName := d.contents(instruction)
-
-	argNodes := instructionArgs(instruction.next)
-
-	var wrappers wrapperStack
-	var args []string
-	changed := false
-
-Args:
-	for i, arg := range argNodes {
-		fullArg := arg
-		isIndirect := false
-
-		if arg.pegRule == ruleIndirectionIndicator {
-			arg = arg.next
-			isIndirect = true
-		}
-
-		switch arg.pegRule {
-		case ruleRegisterOrConstant, ruleLocalLabelRef:
-			args = append(args, d.contents(fullArg))
-
-		case ruleMemoryRef:
-			symbol, offset, section, didChange, symbolIsLocal, memRef := d.parseMemRef(arg.up)
-			changed = didChange
-
-			switch section {
-			case "":
-				if _, knownSymbol := d.symbols[symbol]; knownSymbol {
-					symbol = localTargetName(symbol)
-					changed = true
-				}
-
-			case "PLT":
-				if classifyInstruction(instructionName, argNodes) != instrJump {
-					return nil, fmt.Errorf("Cannot rewrite PLT reference for non-jump instruction %q", instructionName)
-				}
-
-				if _, knownSymbol := d.symbols[symbol]; knownSymbol {
-					symbol = localTargetName(symbol)
-					changed = true
-				} else if !symbolIsLocal && !isSynthesized(symbol) {
-					// Unknown symbol via PLT is an
-					// out-call from the module, e.g.
-					// memcpy.
-					d.redirectors[symbol+"@"+section] = redirectorName(symbol)
-					symbol = redirectorName(symbol)
-				}
-
-				changed = true
-
-			case "GOTPCREL":
-				if len(offset) > 0 {
-					return nil, errors.New("loading from GOT with offset is unsupported")
-				}
-				if !d.isRIPRelative(memRef) {
-					return nil, errors.New("GOT access must be IP-relative")
-				}
-
-				useGOT := false
-				if _, knownSymbol := d.symbols[symbol]; knownSymbol {
-					symbol = localTargetName(symbol)
-					changed = true
-				} else if !isSynthesized(symbol) {
-					useGOT = true
-				}
-
-				classification := classifyInstruction(instructionName, argNodes)
-				if classification != instrThreeArg && classification != instrCompare && i != 0 {
-					return nil, errors.New("GOT access must be source operand")
-				}
-
-				// Reduce the instruction to movq symbol@GOTPCREL, targetReg.
-				var targetReg string
-				var redzoneCleared bool
-				switch classification {
-				case instrPush:
-					wrappers = append(wrappers, push(d.output))
-					targetReg = "%rax"
-				case instrConditionalMove:
-					wrappers = append(wrappers, undoConditionalMove(d.output, instructionName))
-					fallthrough
-				case instrMove:
-					assertNodeType(argNodes[1], ruleRegisterOrConstant)
-					targetReg = d.contents(argNodes[1])
-				case instrCompare:
-					otherSource := d.contents(argNodes[i^1])
-					saveRegWrapper, tempReg := saveRegister(d.output, []string{otherSource})
-					redzoneCleared = true
-					wrappers = append(wrappers, saveRegWrapper)
-					if i == 0 {
-						wrappers = append(wrappers, compare(d.output, instructionName, tempReg, otherSource))
-					} else {
-						wrappers = append(wrappers, compare(d.output, instructionName, otherSource, tempReg))
-					}
-					targetReg = tempReg
-				case instrTransformingMove:
-					assertNodeType(argNodes[1], ruleRegisterOrConstant)
-					targetReg = d.contents(argNodes[1])
-					wrappers = append(wrappers, finalTransform(d.output, instructionName, targetReg))
-					if isValidLEATarget(targetReg) {
-						return nil, errors.New("Currently transforming moves are assumed to target XMM registers. Otherwise we'll pop %rax before reading it to do the transform.")
-					}
-				case instrCombine:
-					targetReg = d.contents(argNodes[1])
-					if !isValidLEATarget(targetReg) {
-						return nil, fmt.Errorf("cannot handle combining instructions targeting non-general registers")
-					}
-					saveRegWrapper, tempReg := saveRegister(d.output, []string{targetReg})
-					redzoneCleared = true
-					wrappers = append(wrappers, saveRegWrapper)
-
-					wrappers = append(wrappers, combineOp(d.output, instructionName, tempReg, targetReg))
-					targetReg = tempReg
-				case instrMemoryVectorCombine:
-					assertNodeType(argNodes[1], ruleRegisterOrConstant)
-					targetReg = d.contents(argNodes[1])
-					if isValidLEATarget(targetReg) {
-						return nil, errors.New("target register must be an XMM register")
-					}
-					saveRegWrapper, tempReg := saveRegister(d.output, nil)
-					wrappers = append(wrappers, saveRegWrapper)
-					redzoneCleared = true
-					wrappers = append(wrappers, memoryVectorCombineOp(d.output, instructionName, tempReg, targetReg))
-					targetReg = tempReg
-				case instrThreeArg:
-					if n := len(argNodes); n != 3 {
-						return nil, fmt.Errorf("three-argument instruction has %d arguments", n)
-					}
-					if i != 0 && i != 1 {
-						return nil, errors.New("GOT access must be from source operand")
-					}
-					targetReg = d.contents(argNodes[2])
-
-					otherSource := d.contents(argNodes[1])
-					if i == 1 {
-						otherSource = d.contents(argNodes[0])
-					}
-
-					saveRegWrapper, tempReg := saveRegister(d.output, []string{targetReg, otherSource})
-					redzoneCleared = true
-					wrappers = append(wrappers, saveRegWrapper)
-
-					if i == 0 {
-						wrappers = append(wrappers, threeArgCombineOp(d.output, instructionName, tempReg, otherSource, targetReg))
-					} else {
-						wrappers = append(wrappers, threeArgCombineOp(d.output, instructionName, otherSource, tempReg, targetReg))
-					}
-					targetReg = tempReg
-				default:
-					return nil, fmt.Errorf("Cannot rewrite GOTPCREL reference for instruction %q", instructionName)
-				}
-
-				if !isValidLEATarget(targetReg) {
-					// Sometimes the compiler will load from the GOT to an
-					// XMM register, which is not a valid target of an LEA
-					// instruction.
-					saveRegWrapper, tempReg := saveRegister(d.output, nil)
-					wrappers = append(wrappers, saveRegWrapper)
-					isAVX := strings.HasPrefix(instructionName, "v")
-					wrappers = append(wrappers, moveTo(d.output, targetReg, isAVX, tempReg))
-					targetReg = tempReg
-					if redzoneCleared {
-						return nil, fmt.Errorf("internal error: Red Zone was already cleared")
-					}
-					redzoneCleared = true
-				}
-
-				if useGOT {
-					wrappers = append(wrappers, d.loadFromGOT(d.output, targetReg, symbol, section, redzoneCleared))
-				} else {
-					wrappers = append(wrappers, func(k func()) {
-						d.output.WriteString(fmt.Sprintf("\tleaq\t%s(%%rip), %s\n", symbol, targetReg))
-					})
-				}
-				changed = true
-				break Args
-
-			default:
-				return nil, fmt.Errorf("Unknown section type %q", section)
-			}
-
-			if !changed && len(section) > 0 {
-				panic("section was not handled")
-			}
-			section = ""
-
-			argStr := ""
-			if isIndirect {
-				argStr += "*"
-			}
-			argStr += symbol
-			argStr += offset
-
-			for ; memRef != nil; memRef = memRef.next {
-				argStr += d.contents(memRef)
-			}
-
-			for suffix := arg.next; suffix != nil; suffix = suffix.next {
-				argStr += d.contents(suffix)
-			}
-
-			args = append(args, argStr)
-
-		case ruleGOTAddress:
-			if instructionName != "leaq" {
-				return nil, fmt.Errorf("_GLOBAL_OFFSET_TABLE_ used outside of lea")
-			}
-			if i != 0 || len(argNodes) != 2 {
-				return nil, fmt.Errorf("Load of _GLOBAL_OFFSET_TABLE_ address didn't have expected form")
-			}
-			if arg.next != nil {
-				return nil, fmt.Errorf("unexpected argument suffix")
-			}
-			d.gotDeltaNeeded = true
-			changed = true
-			targetReg := d.contents(argNodes[1])
-			args = append(args, ".Lboringssl_got_delta(%rip)")
-			wrappers = append(wrappers, func(k func()) {
-				k()
-				d.output.WriteString(fmt.Sprintf("\taddq .Lboringssl_got_delta(%%rip), %s\n", targetReg))
-			})
-
-		case ruleGOTLocation:
-			if instructionName != "movabsq" {
-				return nil, fmt.Errorf("_GLOBAL_OFFSET_TABLE_ lookup didn't use movabsq")
-			}
-			if i != 0 || len(argNodes) != 2 {
-				return nil, fmt.Errorf("movabs of _GLOBAL_OFFSET_TABLE_ didn't expected form")
-			}
-			if arg.next != nil {
-				return nil, fmt.Errorf("unexpected argument suffix")
-			}
-
-			d.gotDeltaNeeded = true
-			changed = true
-			instructionName = "movq"
-			assertNodeType(arg.up, ruleLocalSymbol)
-			baseSymbol := d.mapLocalSymbol(d.contents(arg.up))
-			targetReg := d.contents(argNodes[1])
-			args = append(args, ".Lboringssl_got_delta(%rip)")
-			wrappers = append(wrappers, func(k func()) {
-				k()
-				d.output.WriteString(fmt.Sprintf("\taddq $.Lboringssl_got_delta-%s, %s\n", baseSymbol, targetReg))
-			})
-
-		case ruleGOTSymbolOffset:
-			if instructionName != "movabsq" {
-				return nil, fmt.Errorf("_GLOBAL_OFFSET_TABLE_ offset didn't use movabsq")
-			}
-			if i != 0 || len(argNodes) != 2 {
-				return nil, fmt.Errorf("movabs of _GLOBAL_OFFSET_TABLE_ offset didn't have expected form")
-			}
-			if arg.next != nil {
-				return nil, fmt.Errorf("unexpected argument suffix")
-			}
-
-			assertNodeType(arg.up, ruleSymbolName)
-			symbol := d.contents(arg.up)
-			if strings.HasPrefix(symbol, ".L") {
-				symbol = d.mapLocalSymbol(symbol)
-			}
-			targetReg := d.contents(argNodes[1])
-
-			var prefix string
-			isGOTOFF := strings.HasSuffix(d.contents(arg), "@GOTOFF")
-			if isGOTOFF {
-				prefix = "gotoff"
-				d.gotOffOffsetsNeeded[symbol] = struct{}{}
-			} else {
-				prefix = "got"
-				d.gotOffsetsNeeded[symbol] = struct{}{}
-			}
-			changed = true
-
-			wrappers = append(wrappers, func(k func()) {
-				// Even if one tries to use 32-bit GOT offsets, Clang's linker (at the time
-				// of writing) emits 64-bit relocations anyway, so the following four bytes
-				// get stomped. Thus we use 64-bit offsets.
-				d.output.WriteString(fmt.Sprintf("\tmovq .Lboringssl_%s_%s(%%rip), %s\n", prefix, symbol, targetReg))
-			})
-
-		default:
-			panic(fmt.Sprintf("unknown instruction argument type %q", rul3s[arg.pegRule]))
-		}
-	}
-
-	if changed {
-		d.writeCommentedNode(statement)
-		replacement := "\t" + instructionName + "\t" + strings.Join(args, ", ") + "\n"
-		if prefix != "" {
-			replacement = "\t" + prefix + replacement
-		}
-		wrappers.do(func() {
-			d.output.WriteString(replacement)
-		})
-	} else {
-		d.writeNode(statement)
-	}
-
-	return statement, nil
-}
-
 func (d *delocation) handleBSS(statement *node32) (*node32, error) {
 	lastStatement := statement
 	for statement = statement.next; statement != nil; lastStatement, statement = statement, statement.next {
@@ -1430,28 +759,24 @@ func (d *delocation) handleBSS(statement *node32) (*node32, error) {
 	return lastStatement, nil
 }
 
-func writeAarch64Function(w stringWriter, funcName string, writeContents func(stringWriter)) {
-	w.WriteString(".p2align 2\n")
-	w.WriteString(".hidden " + funcName + "\n")
-	w.WriteString(".type " + funcName + ", @function\n")
-	w.WriteString(funcName + ":\n")
-	w.WriteString(".cfi_startproc\n")
-	// We insert a landing pad (`bti c` instruction) unconditionally at the beginning of
-	// every generated function so that they can be called indirectly (with `blr` or
-	// `br x16/x17`). The instruction is encoded in the HINT space as `hint #34` and is
-	// a no-op on machines or program states not supporting BTI (Branch Target Identification).
-	// None of the generated function bodies call other functions (with bl or blr), so we only
-	// insert a landing pad instead of signing and validating $lr with `paciasp` and `autiasp`.
-	// Normally we would also generate a .note.gnu.property section to annotate the assembly
-	// file as BTI-compatible, but if the input assembly files are BTI-compatible, they should
-	// already have those sections so there is no need to add an extra one ourselves.
-	w.WriteString("\thint #34 // bti c\n")
-	writeContents(w)
-	w.WriteString(".cfi_endproc\n")
-	w.WriteString(".size " + funcName + ", .-" + funcName + "\n")
-}
-
 func transform(w stringWriter, inputs []inputFile) error {
+	// Detect the processor and object format up front; symbol gathering below
+	// needs them to recognise AArch64's bare 'L' local-label convention.
+	processor := x86_64
+	if len(inputs) > 0 {
+		processor = detectProcessor(inputs[0])
+	}
+	format := objectFormatELF
+	if len(inputs) > 0 {
+		format = detectFormat(inputs[0])
+	}
+	// isLocalLabelName reports whether a label/symbol is file-local and thus
+	// must not be treated as a (unique) module-global symbol.
+	isLocalLabelName := func(name string) bool {
+		return processor == aarch64 && format == objectFormatCOFF &&
+			len(name) >= 2 && name[0] == 'L'
+	}
+
 	// symbols contains all defined symbols.
 	symbols := make(map[string]struct{})
 	// fileNumbers is the set of IDs seen in .file directives.
@@ -1467,6 +792,12 @@ func transform(w stringWriter, inputs []inputFile) error {
 	for _, input := range inputs {
 		forEachPath(input.ast.up, func(node *node32) {
 			symbol := input.contents[node.begin:node.end]
+			// AArch64 COFF bare 'L' labels are file-local; they are mapped
+			// per-file (like ".L") and must not be registered as module-global
+			// symbols (which would falsely collide across input files).
+			if isLocalLabelName(symbol) {
+				return
+			}
 			if _, ok := symbols[symbol]; ok {
 				panic(fmt.Sprintf("Duplicate symbol found: %q in %q", symbol, input.path))
 			}
@@ -1520,11 +851,7 @@ func transform(w stringWriter, inputs []inputFile) error {
 			}
 		}, ruleStatement, ruleLocationDirective)
 	}
-
-	processor := x86_64
-	if len(inputs) > 0 {
-		processor = detectProcessor(inputs[0])
-	}
+	// processor and format were detected at the top of transform.
 
 	commentIndicator := "#"
 	if processor == aarch64 {
@@ -1541,6 +868,7 @@ func transform(w stringWriter, inputs []inputFile) error {
 	d := &delocation{
 		symbols:             symbols,
 		processor:           processor,
+		format:              format,
 		commentIndicator:    commentIndicator,
 		output:              w,
 		redirectors:         make(map[string]string),
@@ -1548,139 +876,14 @@ func transform(w stringWriter, inputs []inputFile) error {
 		gotExternalsNeeded:  make(map[string]struct{}),
 		gotOffsetsNeeded:    make(map[string]struct{}),
 		gotOffOffsetsNeeded: make(map[string]struct{}),
+		coffExternalPtrs:    make(map[string]struct{}),
+		coffSymbolRenames:   make(map[string]string),
 	}
 
-	w.WriteString(".text\n")
-	if processor == aarch64 {
-		// Ensure the overall section to a page boundary. This allows us to safely emit ADRP
-		// instructions. ADRP SYMBOL always emits a relocation because its offset is
-		// (SYMBOL & ~4095) - (PC & ~4095). For this to be a link-independent constant, not
-		// only must SYMBOL - PC be link-independent, so must both SYMBOL & 4095 and
-		// PC & 4095.
-		//
-		// As of writing, there is already a page-aligned symbol in BCM, so this is a no-op,
-		// but do not rely on this.
-		w.WriteString(".p2align 12\n")
+	if d.format == objectFormatCOFF {
+		return d.emitModuleCOFF(w, inputs, maxObservedFileNumber, fileDirectivesContainMD5)
 	}
-	var fileTrailing string
-	if fileDirectivesContainMD5 {
-		fileTrailing = " md5 0x00000000000000000000000000000000"
-	}
-	w.WriteString(fmt.Sprintf(".file %d \"inserted_by_delocate.c\"%s\n", maxObservedFileNumber+1, fileTrailing))
-	w.WriteString(fmt.Sprintf(".loc %d 1 0\n", maxObservedFileNumber+1))
-	w.WriteString("BORINGSSL_bcm_text_start:\n")
-	w.WriteString(localTargetName("BORINGSSL_bcm_text_start") + ":\n")
-
-	for _, input := range inputs {
-		if err := d.processInput(input); err != nil {
-			return err
-		}
-	}
-
-	w.WriteString(".text\n")
-	w.WriteString(fmt.Sprintf(".loc %d 2 0\n", maxObservedFileNumber+1))
-	w.WriteString("BORINGSSL_bcm_text_end:\n")
-	w.WriteString(localTargetName("BORINGSSL_bcm_text_end") + ":\n")
-
-	// Emit redirector functions. Each is a single jump instruction.
-	var redirectorNames []string
-	for name := range d.redirectors {
-		redirectorNames = append(redirectorNames, name)
-	}
-	sort.Strings(redirectorNames)
-
-	for _, name := range redirectorNames {
-		redirector := d.redirectors[name]
-		switch d.processor {
-		case aarch64:
-			writeAarch64Function(w, redirector, func(w stringWriter) {
-				w.WriteString("\tb " + name + "\n")
-			})
-
-		case x86_64:
-			w.WriteString(".type " + redirector + ", @function\n")
-			w.WriteString(redirector + ":\n")
-			w.WriteString("\tjmp\t" + name + "\n")
-		}
-	}
-
-	var accessorNames []string
-	for accessor := range d.bssAccessorsNeeded {
-		accessorNames = append(accessorNames, accessor)
-	}
-	sort.Strings(accessorNames)
-
-	// Emit BSS accessor functions. Each is a single LEA followed by RET.
-	for _, name := range accessorNames {
-		funcName := accessorName(name)
-		target := d.bssAccessorsNeeded[name]
-
-		switch d.processor {
-		case x86_64:
-			w.WriteString(".type " + funcName + ", @function\n")
-			w.WriteString(funcName + ":\n")
-			w.WriteString("\tleaq\t" + target + "(%rip), %rax\n\tret\n")
-
-		case aarch64:
-			writeAarch64Function(w, funcName, func(w stringWriter) {
-				w.WriteString("\tadrp x0, " + target + "\n")
-				w.WriteString("\tadd x0, x0, :lo12:" + target + "\n")
-				w.WriteString("\tret\n")
-			})
-		}
-	}
-
-	switch d.processor {
-	case aarch64:
-		externalNames := sortedSet(d.gotExternalsNeeded)
-		for _, symbol := range externalNames {
-			writeAarch64Function(w, gotHelperName(symbol), func(w stringWriter) {
-				w.WriteString("\tadrp x0, :got:" + symbol + "\n")
-				w.WriteString("\tldr x0, [x0, :got_lo12:" + symbol + "]\n")
-				w.WriteString("\tret\n")
-			})
-		}
-
-	case x86_64:
-		externalNames := sortedSet(d.gotExternalsNeeded)
-		for _, name := range externalNames {
-			parts := strings.SplitN(name, "@", 2)
-			symbol, section := parts[0], parts[1]
-			w.WriteString(".type " + symbol + "_" + section + "_external, @object\n")
-			w.WriteString(".size " + symbol + "_" + section + "_external, 8\n")
-			w.WriteString(symbol + "_" + section + "_external:\n")
-			// Ideally this would be .quad foo@GOTPCREL, but clang's
-			// assembler cannot emit a 64-bit GOTPCREL relocation. Instead,
-			// we manually sign-extend the value, knowing that the GOT is
-			// always at the end, thus foo@GOTPCREL has a positive value.
-			w.WriteString("\t.long " + symbol + "@" + section + "\n")
-			w.WriteString("\t.long 0\n")
-		}
-
-		if d.gotDeltaNeeded {
-			w.WriteString(".Lboringssl_got_delta:\n")
-			w.WriteString("\t.quad _GLOBAL_OFFSET_TABLE_-.Lboringssl_got_delta\n")
-		}
-
-		for _, name := range sortedSet(d.gotOffsetsNeeded) {
-			w.WriteString(".Lboringssl_got_" + name + ":\n")
-			w.WriteString("\t.quad " + name + "@GOT\n")
-		}
-		for _, name := range sortedSet(d.gotOffOffsetsNeeded) {
-			w.WriteString(".Lboringssl_gotoff_" + name + ":\n")
-			w.WriteString("\t.quad " + name + "@GOTOFF\n")
-		}
-	}
-
-	w.WriteString(".type BORINGSSL_bcm_text_hash, @object\n")
-	w.WriteString(".size BORINGSSL_bcm_text_hash, 32\n")
-	w.WriteString("BORINGSSL_bcm_text_hash:\n")
-	w.WriteString(localTargetName("BORINGSSL_bcm_text_hash") + ":\n")
-	for _, b := range fipscommon.UninitHashValue {
-		w.WriteString(".byte 0x" + strconv.FormatUint(uint64(b), 16) + "\n")
-	}
-
-	return nil
+	return d.emitModuleELF(w, inputs, maxObservedFileNumber, fileDirectivesContainMD5)
 }
 
 // preprocess runs source through the C preprocessor.
@@ -1917,10 +1120,38 @@ func (w *wrapperStack) do(baseCase func()) {
 	wrapper(func() { w.do(baseCase) })
 }
 
+// isQuotedSymbol reports whether name is a COFF/MSVC quoted symbol ("....").
+func isQuotedSymbol(name string) bool {
+	return len(name) >= 2 && name[0] == '"' && name[len(name)-1] == '"'
+}
+
+// decorateSymbol wraps a symbol name with a prefix and suffix. For MSVC/COFF
+// quoted symbols ("?foo@@..."), the prefix/suffix are inserted *inside* the
+// quotes so the result is still a single valid quoted symbol. For ordinary
+// (GNU) names it is just prefix+name+suffix.
+func decorateSymbol(prefix, name, suffix string) string {
+	if isQuotedSymbol(name) {
+		return "\"" + prefix + name[1:len(name)-1] + suffix + "\""
+	}
+	return prefix + name + suffix
+}
+
 // localTargetName returns the name of the local target label for a global
 // symbol named name.
 func localTargetName(name string) string {
-	return ".L" + name + "_local_target"
+	return decorateSymbol(".L", name, "_local_target")
+}
+
+// isAarch64LocalLabel reports whether name uses AArch64's bare 'L' private
+// (local) label prefix. clang's assembler treats 'L'-prefixed symbols as
+// file-local (temporary) on AArch64 COFF/Mach-O, unlike ELF's ".L". The
+// perlasm-generated *-armv8-win.S files use this convention (e.g. "Loop",
+// "LK256"), so when delocate flattens several of them into one unit these
+// per-file labels would otherwise collide. We map them per-file like ".L"
+// labels. (ELF AArch64 uses ".L", so this only applies to COFF.)
+func (d *delocation) isAarch64LocalLabel(name string) bool {
+	return d.processor == aarch64 && d.format == objectFormatCOFF &&
+		len(name) >= 2 && name[0] == 'L'
 }
 
 func isSynthesized(symbol string) bool {
@@ -1928,7 +1159,7 @@ func isSynthesized(symbol string) bool {
 }
 
 func redirectorName(symbol string) string {
-	return "bcm_redirector_" + symbol
+	return decorateSymbol("bcm_redirector_", symbol, "")
 }
 
 // sectionType returns the type of a section. I.e. a section called “.text.foo”
@@ -1953,7 +1184,7 @@ func sectionType(section string) (string, bool) {
 // accessorName returns the name of the accessor function for a BSS symbol
 // named name.
 func accessorName(name string) string {
-	return name + "_bss_get"
+	return decorateSymbol("", name, "_bss_get")
 }
 
 func (d *delocation) mapLocalSymbol(symbol string) string {
@@ -1961,6 +1192,39 @@ func (d *delocation) mapLocalSymbol(symbol string) string {
 		return symbol
 	}
 	return symbol + "_BCM_" + strconv.Itoa(d.currentInput.index)
+}
+
+// shouldRenameCOFFSymbol은 COFF에서 파일별로 유일한 이름으로 개명해야 하는
+// 심볼인지 판단한다. perlasm이 생성하는 SEH 핸들러 같은 중복 가능한 심볼들을
+// 감지한다. 예: *_handler 패턴.
+func shouldRenameCOFFSymbol(symbol string) bool {
+	// SEH 핸들러 심볼: se_handler, mul_handler, sqr_handler, 등
+	return strings.HasSuffix(symbol, "_handler")
+}
+
+// mapCOFFSymbol은 COFF에서 필요시 심볼을 파일별로 유일한 이름으로 개명하고,
+// 이미 개명된 경우 매핑된 이름을 반환한다. 같은 심볼이 여러 번 나타날 때
+// 일관성 있게 개명된 이름을 반환한다.
+func (d *delocation) mapCOFFSymbol(symbol string) string {
+	if d.format != objectFormatCOFF || d.currentInput.index == 0 {
+		return symbol
+	}
+	if !shouldRenameCOFFSymbol(symbol) {
+		return symbol
+	}
+
+	// 이미 개명되었으면 매핑된 이름 반환.
+	if renamed, ok := d.coffSymbolRenames[symbol]; ok {
+		return renamed
+	}
+
+	// 새로운 개명: 파일 이름의 base를 접두사로 사용하거나, 파일 index 사용.
+	// 예: se_handler (from vpaes-x86_64.pl) -> vpaes_se_handler
+	// 간단하게는 파일 index를 사용할 수도 있지만, 가독성을 위해 파일 이름 기반이 좋다.
+	// 현재는 파일 index만 사용하되, 미래에 파일 이름 기반으로 개선 가능.
+	renamed := symbol + "_BCM_" + strconv.Itoa(d.currentInput.index)
+	d.coffSymbolRenames[symbol] = renamed
+	return renamed
 }
 
 func detectProcessor(input inputFile) processorType {
@@ -1982,6 +1246,27 @@ func detectProcessor(input inputFile) processorType {
 	}
 
 	panic("processed entire input and didn't recognise any instructions.")
+}
+
+// detectFormat 는 입력 어셈블리의 오브젝트 파일 형식을 추정한다. COFF(윈도우)
+// 어셈블리는 `.def`/`.seh_proc`/`.secrel32` 같은 형식 고유 디렉티브를 사용하므로
+// 이를 발견하면 COFF 로 판정하고, 그렇지 않으면 ELF/Mach-O 로 본다.
+func detectFormat(input inputFile) objectFormat {
+	for statement := input.ast.up; statement != nil; statement = statement.next {
+		node := skipNodes(statement.up, ruleWS)
+		if node == nil || node.pegRule != ruleDirective {
+			continue
+		}
+		directive := node.up
+		if directive == nil || directive.pegRule != ruleDirectiveName {
+			continue
+		}
+		switch input.contents[directive.begin:directive.end] {
+		case "def", "seh_proc", "secrel32", "secidx", "linkonce":
+			return objectFormatCOFF
+		}
+	}
+	return objectFormatELF
 }
 
 func sortedSet(m map[string]struct{}) []string {

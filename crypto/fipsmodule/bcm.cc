@@ -20,8 +20,20 @@
 
 #include <stdlib.h>
 #if defined(BORINGSSL_FIPS)
+#if !defined(OPENSSL_WINDOWS) && !defined(KORECRYPTO_BAREMETAL)
+// sys/mman.h / unistd.h 는 POSIX 전용이다. 윈도우(COFF)/bare-metal(freestanding,
+// 예: UEFI)에서는 mprotect 경로가 Android/AArch64 에서만 쓰이므로 헤더를 포함하지
+// 않고, 아래에서 PROT_* 매크로만 정의해 무결성 검사 호출부가 컴파일되도록 한다.
 #include <sys/mman.h>
 #include <unistd.h>
+#else
+#ifndef PROT_READ
+#define PROT_READ 0x1
+#endif
+#ifndef PROT_EXEC
+#define PROT_EXEC 0x4
+#endif
+#endif
 #endif
 
 #include <openssl/digest.h>
@@ -51,6 +63,10 @@ OPENSSL_CLANG_PRAGMA("clang diagnostic ignored \"-Wheader-hygiene\"")
 #include "aes/key_wrap.cc.inc"
 #include "aes/mode_wrappers.cc.inc"
 #include "aes/ofb.cc.inc"
+#include "aria/aria.cc.inc"
+#include "lea/lea.cc.inc"
+#include "seed/seed.cc.inc"
+#include "hight/hight.cc.inc"
 #include "bn/add.cc.inc"
 #include "bn/asm/x86_64-gcc.cc.inc"
 #include "bn/bn.cc.inc"
@@ -76,11 +92,16 @@ OPENSSL_CLANG_PRAGMA("clang diagnostic ignored \"-Wheader-hygiene\"")
 #include "cipher/cipher.cc.inc"
 #include "cipher/e_aes.cc.inc"
 #include "cipher/e_aesccm.cc.inc"
+#include "cipher/e_aria.cc.inc"
+#include "cipher/e_lea.cc.inc"
+#include "cipher/e_seed.cc.inc"
+#include "cipher/e_hight.cc.inc"
 #include "cmac/cmac.cc.inc"
 #include "dh/check.cc.inc"
 #include "dh/dh.cc.inc"
 #include "digest/digest.cc.inc"
 #include "digest/digests.cc.inc"
+#include "lsh/lsh.cc.inc"
 #include "digestsign/digestsign.cc.inc"
 #include "ec/ec.cc.inc"
 #include "ec/ec_key.cc.inc"
@@ -98,7 +119,12 @@ OPENSSL_CLANG_PRAGMA("clang diagnostic ignored \"-Wheader-hygiene\"")
 #include "entropy/jitter.cc.inc"
 #include "hkdf/hkdf.cc.inc"
 #include "hmac/hmac.cc.inc"
+#include "kdf/kbkdf.cc.inc"
+#include "rand/drbg90a.cc.inc"
+#include "eckcdsa/eckcdsa.cc.inc"
+#include "kcdsa/kcdsa.cc.inc"
 #include "keccak/keccak.cc.inc"
+#include "keccak/e_sha3.cc.inc"
 #include "mldsa/mldsa.cc.inc"
 #include "mlkem/mlkem.cc.inc"
 #include "rand/android_entropy_client.cc.inc"
@@ -131,6 +157,11 @@ using namespace bssl;
 // These symbols are filled in by delocate.go (in static builds) or a linker
 // script (in shared builds). They point to the start and end of the module, and
 // the location of the integrity hash, respectively.
+//
+// extern "C" 로 선언해 모든 ABI 에서 맹글링 없는 이름을 갖게 한다. 특히 MSVC ABI
+// (x86_64-unknown-uefi)는 전역 C++ 변수도 맹글링하므로(?...@@3QBEB) extern "C" 가
+// 없으면 delocate 가 합성하는 바닐라 심볼(BORINGSSL_bcm_text_*)과 어긋난다.
+extern "C" {
 extern const uint8_t BORINGSSL_bcm_text_start[];
 extern const uint8_t BORINGSSL_bcm_text_end[];
 extern const uint8_t BORINGSSL_bcm_text_hash[SHA256_DIGEST_LENGTH];
@@ -138,6 +169,7 @@ extern const uint8_t BORINGSSL_bcm_text_hash[SHA256_DIGEST_LENGTH];
 extern const uint8_t BORINGSSL_bcm_rodata_start[];
 extern const uint8_t BORINGSSL_bcm_rodata_end[];
 #endif
+}
 
 // assert_within is used to sanity check that certain symbols are within the
 // bounds of the integrity check. It checks that start <= symbol < end and
